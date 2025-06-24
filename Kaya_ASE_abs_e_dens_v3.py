@@ -3,6 +3,7 @@ import tkinter as tk
 from tkinter import filedialog
 import glob
 import os
+import pandas as pd
 
 def calculate_absorbed_energy_density(excitation_intensity, absorbance, excitation_area_size):
     """
@@ -14,12 +15,17 @@ def calculate_absorbed_energy_density(excitation_intensity, absorbance, excitati
 
 def add_absorbed_energy_density(input_file, output_file, absorbance, excitation_area_size, closest_wavelength, absorption_rate, emission_intensities):
     """
-    txtファイルに吸収エネルギー密度、励起エリアサイズ、337nmに最も近い波長、吸光度、吸収率、発光強度を追加する関数
+    Excelファイルに吸収エネルギー密度、励起エリアサイズ、337nmに最も近い波長、吸光度、吸収率、発光強度を追加する関数
     """
     try:
-        data = np.loadtxt(input_file, skiprows=1)
+        # Excelファイルの読み込み (1行目をヘッダーとする)
+        df = pd.read_excel(input_file, header=0)
+        data = df.values
     except FileNotFoundError:
         print(f"エラー: ファイル '{input_file}' が見つかりません。")
+        return
+    except Exception as e:
+        print(f"エラー: Excelファイル '{input_file}' の読み込み中にエラーが発生しました: {e}")
         return
 
     absorbed_energy_densities = []
@@ -35,9 +41,18 @@ def add_absorbed_energy_density(input_file, output_file, absorbance, excitation_
     absorption_rates_arr = np.full(len(data), absorption_rate) # 吸収率
 
     output_data = np.column_stack((data, excitation_area_sizes, closest_wavelengths, absorbances, absorption_rates_arr, absorbed_energy_densities, emission_intensities))
-    header = 'filter_number\texcitation_intensity\texcitation_area_size(cm^2)\tclosest_wavelength(nm)\tabsorbance\tabsorption_rate\tabsorbed_energy_density\temission_intensity'
-    np.savetxt(output_file, output_data, fmt='%.6f', delimiter='\t', header=header, comments='')
-    print(f"吸収エネルギー密度を計算し、'{output_file}' に出力しました。")
+    
+    # ヘッダーをリストとして定義
+    header = ['filter_number', 'excitation_intensity', 'excitation_area_size(cm^2)', 'closest_wavelength(nm)', 'absorbance', 'absorption_rate', 'absorbed_energy_density', 'emission_intensity']
+    
+    # Pandas DataFrameを作成してExcelファイルに出力
+    output_df = pd.DataFrame(output_data, columns=header)
+    try:
+        output_df.to_excel(output_file, index=False) # index=FalseでExcelに行番号が出力されるのを防ぐ
+        print(f"吸収エネルギー密度を計算し、'{output_file}' に出力しました。")
+    except Exception as e:
+        print(f"エラー: Excelファイル '{output_file}' の書き込み中にエラーが発生しました: {e}")
+
 
 def extract_absorbance_from_spectrum(spectrum_file, target_wavelength=337):
     """
@@ -99,7 +114,7 @@ def main():
     root.withdraw()  # メインウィンドウを非表示にする
 
     # 入力ファイルの選択
-    input_file_path = filedialog.askopenfilename(title="励起強度データファイルを選択してください", filetypes=[("Text files", "*.txt")])
+    input_file_path = filedialog.askopenfilename(title="励起強度データファイル(.xlsx)を選択してください", filetypes=[("Excel files", "*.xlsx")])
     if not input_file_path:
         return  # ファイルが選択されなかった場合は終了
 
@@ -108,16 +123,20 @@ def main():
     if not spectrum_file_path:
         return  # ファイルが選択されなかった場合は終了
 
-    # 出力ファイルの保存先と名前の指定
-    output_file_path = filedialog.asksaveasfilename(title="出力テキストファイルを保存してください", defaultextension=".txt", filetypes=[("Text files", "*.txt")])
-    if not output_file_path:
-        return  # 保存先が選択されなかった場合は終了
+    # 出力ファイルパスを自動生成 (例: input.xlsx -> input_after.xlsx)
+    base_name, _ = os.path.splitext(input_file_path)
+    output_file_path = f"{base_name}_after.xlsx"
 
     # 励起強度データファイルを読み込む
     try:
-        excitation_data = np.loadtxt(input_file_path, skiprows=1)
+        # Excelファイルの読み込み (1行目をヘッダーとする)
+        df_excitation = pd.read_excel(input_file_path, header=0)
+        excitation_data = df_excitation.values
     except FileNotFoundError:
         print(f"エラー: ファイル '{input_file_path}' が見つかりません。")
+        return
+    except Exception as e:
+        print(f"エラー: Excelファイル '{input_file_path}' の読み込み中にエラーが発生しました: {e}")
         return
 
     emission_intensities = []
