@@ -8,41 +8,43 @@ from matplotlib.widgets import RangeSlider
 import os
 import math
 
-# --- 科学技術計算ライブラリ ---
+# --- Scientific Computing Libraries ---
 from scipy.signal import savgol_filter
 from scipy.optimize import curve_fit
 
 class FWHMAnalyzerApp:
     def __init__(self, master):
         self.master = master
-        master.title("FWHM 解析プログラム - 完成版")
-        master.geometry("800x600")
+        master.title("FWHM Analysis Program")
+        master.geometry("850x650") # Expanded size slightly for new widgets
 
+        # --- Application State Variables ---
         self.excel_file_path = None
         self.df_results = None
         self.spectrum_files_data = []
         self.fwhm_results = {}
         self.output_graph_dir = None
-        
-        # --- 変更点：グラフフレームをインデックスで管理するための辞書 ---
         self.graph_frames = {}
 
-        main_frame = tk.Frame(master)
+        # --- Main UI Frames ---
+        main_frame = ttk.Frame(master)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        control_frame = tk.Frame(main_frame, pady=10)
+        control_frame = ttk.Frame(main_frame, padding="10")
         control_frame.pack(fill=tk.X)
 
-        self.btn_load_excel = ttk.Button(control_frame, text="① Excelファイルを選択", command=self.load_excel_file)
-        self.btn_load_excel.pack(side=tk.LEFT, padx=10)
+        # --- Control Widgets ---
+        self.btn_load_excel = ttk.Button(control_frame, text="① Select Excel File", command=self.load_excel_file)
+        self.btn_load_excel.pack(side=tk.LEFT, padx=5)
+
+        self.btn_reset = ttk.Button(control_frame, text="Reset", command=self._reset_application)
+        self.btn_reset.pack(side=tk.LEFT, padx=5)
         
-        self.btn_save = ttk.Button(control_frame, text="③ 結果を保存", command=self.save_results, state="disabled")
-        self.btn_save.pack(side=tk.RIGHT, padx=10)
-
-        self.status_label = ttk.Label(control_frame, text="処理を開始してください。")
-        self.status_label.pack(side=tk.LEFT, padx=10)
-
-        canvas_frame = tk.Frame(main_frame)
+        self.btn_save = ttk.Button(control_frame, text="③ Save Results", command=self.save_results, state="disabled")
+        self.btn_save.pack(side=tk.RIGHT, padx=5)
+        
+        # --- Canvas for scrollable graphs ---
+        canvas_frame = ttk.Frame(main_frame)
         canvas_frame.pack(fill=tk.BOTH, expand=True)
         
         self.canvas = tk.Canvas(canvas_frame)
@@ -55,13 +57,49 @@ class FWHMAnalyzerApp:
 
         self.canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+        
+        # --- Status Bar and Progress Bar ---
+        status_frame = ttk.Frame(master, padding="2 5")
+        status_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status_label = ttk.Label(status_frame, text="Please start by selecting an Excel file.")
+        self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.progressbar = ttk.Progressbar(status_frame, orient='horizontal', mode='determinate')
+        self.progressbar.pack(side=tk.RIGHT, padx=5)
+
+        # --- Bindings ---
         self.master.bind_all("<MouseWheel>", self._on_mousewheel)
+        # Keyboard shortcuts
+        self.master.bind("<Control-o>", lambda event: self.load_excel_file())
+        self.master.bind("<Control-s>", lambda event: self.save_results() if self.btn_save['state'] == 'normal' else None)
+        self.master.bind("<Control-r>", lambda event: self._reset_application())
+
+    def _reset_application(self):
+        """ Resets the application to its initial state. """
+        if messagebox.askyesno("Confirm Reset", "Are you sure you want to clear all data and reset the application?"):
+            # Clear all data
+            for widget in self.scrollable_frame.winfo_children():
+                widget.destroy()
+            
+            # Reset state variables
+            self.excel_file_path = None
+            self.df_results = None
+            self.spectrum_files_data.clear()
+            self.fwhm_results.clear()
+            self.output_graph_dir = None
+            self.graph_frames.clear()
+
+            # Reset UI elements
+            self.status_label.config(text="Please start by selecting an Excel file.")
+            self.btn_load_excel.config(state="normal")
+            self.btn_save.config(state="disabled")
+            self.progressbar.config(value=0)
+            print("Application has been reset.")
 
     def _on_mousewheel(self, event):
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def load_excel_file(self):
-        self.excel_file_path = filedialog.askopenfilename(title="結果ファイル (..._after.xlsx) を選択", filetypes=[("Excel files", "*.xlsx")])
+        self.excel_file_path = filedialog.askopenfilename(title="Select the results file (..._after.xlsx)", filetypes=[("Excel files", "*.xlsx")])
         if not self.excel_file_path: return
         try:
             self.df_results = pd.read_excel(self.excel_file_path)
@@ -70,52 +108,45 @@ class FWHMAnalyzerApp:
             self.output_graph_dir = os.path.join(output_dir, "FWHM_Analysis_Graphs")
             os.makedirs(self.output_graph_dir, exist_ok=True)
             
-            self.status_label.config(text=f"'{os.path.basename(self.excel_file_path)}' を読み込みました。次に対応するスペクトルファイルを選択してください。")
+            self.status_label.config(text=f"Loaded '{os.path.basename(self.excel_file_path)}'. Please select the corresponding spectrum files.")
             self.btn_load_excel.config(state="disabled")
             self.process_spectra()
         except Exception as e:
-            messagebox.showerror("エラー", f"Excelファイルの読み込みに失敗しました: {e}")
+            messagebox.showerror("Error", f"Failed to load Excel file: {e}")
 
-    # --- 新規追加：重複ファイル解決用ダイアログ ---
     def _ask_resolve_duplicate(self, filter_num, path1, path2):
-        """フィルタ番号が重複した際に、ユーザーに使用するファイルを選択させるダイアログを表示する"""
         dialog = tk.Toplevel(self.master)
-        dialog.title("重複ファイルの解決")
+        dialog.title("Resolve Duplicate File")
         dialog.geometry("500x200")
         dialog.transient(self.master)
         dialog.grab_set()
 
         result = tk.StringVar(value="")
-        message = f"フィルタ番号 '{filter_num}' のファイルが重複しています。\nどちらを使用しますか？"
+        message = f"Filter number '{filter_num}' is duplicated.\nWhich file would you like to use?"
         ttk.Label(dialog, text=message, padding=20).pack()
 
-        frame = tk.Frame(dialog)
+        frame = ttk.Frame(dialog)
         frame.pack(pady=10)
-
         basename1 = os.path.basename(path1)
         basename2 = os.path.basename(path2)
-
         def select_and_close(path):
             result.set(path)
             dialog.destroy()
-
         ttk.Button(frame, text=basename1, command=lambda: select_and_close(path1), width=40).pack(pady=5)
         ttk.Button(frame, text=basename2, command=lambda: select_and_close(path2), width=40).pack(pady=5)
-
         self.master.wait_window(dialog)
         return result.get()
 
-    # --- 全面改修：ファイル一括選択と自動マッピング処理 ---
     def process_spectra(self):
         num_spectra_expected = len(self.df_results)
         if num_spectra_expected == 0: return
 
         spec_paths = filedialog.askopenfilenames(
-            title="スペクトルファイルを選択してください",
+            title="Select spectrum files",
             filetypes=[("Spectrum files", "*.txp *.txt *.csv"), ("All files", "*.*")]
         )
         if not spec_paths:
-            self.status_label.config(text="処理が中断されました。")
+            self.status_label.config(text="Operation cancelled.")
             self.btn_load_excel.config(state="normal")
             return
 
@@ -130,50 +161,52 @@ class FWHMAnalyzerApp:
                 if filter_num in path_map:
                     chosen_path = self._ask_resolve_duplicate(filter_num, path_map[filter_num], path)
                     if not chosen_path:
-                        messagebox.showwarning("中断", "重複ファイルの解決がキャンセルされたため、処理を中断します。")
+                        messagebox.showwarning("Cancelled", "Duplicate file resolution was cancelled. Aborting process.")
                         self.btn_load_excel.config(state="normal")
                         return
                     path_map[filter_num] = chosen_path
                 else:
                     path_map[filter_num] = path
             except (ValueError, IndexError):
-                print(f"情報: '{basename}' は命名規則に合わないためスキップします。")
+                print(f"Info: Skipping '{basename}' as it does not match the naming convention.")
                 continue
 
         required_filters = self.df_results.get('filter_number', pd.Series(range(1, num_spectra_expected + 1), index=self.df_results.index))
         missing_filters = [f for f in required_filters if f not in path_map]
 
         if missing_filters:
-            msg = "以下のフィルタ番号に対応するファイルが見つかりません:\n\n"
+            msg = "The following required files were not found:\n\n"
             msg += ", ".join(map(str, missing_filters))
-            msg += "\n\n処理を続行しますか？（見つからないデータはスキップされます）"
-            if not messagebox.askyesno("ファイル不足の確認", msg):
-                self.status_label.config(text="処理が中断されました。")
+            msg += "\n\nDo you want to continue? (Missing data will be skipped)"
+            if not messagebox.askyesno("Missing Files Confirmation", msg):
+                self.status_label.config(text="Operation cancelled.")
                 self.btn_load_excel.config(state="normal")
                 return
 
-        # 既存のグラフやデータをクリア
-        for widget in self.scrollable_frame.winfo_children():
-            widget.destroy()
+        for widget in self.scrollable_frame.winfo_children(): widget.destroy()
         self.spectrum_files_data.clear()
         self.graph_frames.clear()
 
+        self.progressbar.config(maximum=num_spectra_expected, value=0)
+        
         for index, row in self.df_results.iterrows():
             filter_num = row.get('filter_number', index + 1)
             spec_path = path_map.get(filter_num)
             
-            if not spec_path:
-                continue
+            self.progressbar.step(1)
+            self.master.update_idletasks()
+
+            if not spec_path: continue
 
             try:
                 spec_data = np.loadtxt(spec_path, skiprows=1)
                 self.spectrum_files_data.append({'path': spec_path, 'data': spec_data, 'filter_num': filter_num, 'original_index': index})
                 self.add_spectrum_graph(spec_data, f"Filter: {filter_num}", index)
             except Exception as e:
-                messagebox.showerror("ファイル読み込みエラー", f"'{os.path.basename(spec_path)}' の読み込みに失敗しました: {e}")
+                messagebox.showerror("File Read Error", f"Failed to read '{os.path.basename(spec_path)}': {e}")
                 return
 
-        self.status_label.config(text="グラフを表示しました。各グラフの解析を開始してください。")
+        self.status_label.config(text="All graphs displayed. Please begin analysis.")
         self.btn_save.config(state="normal")
 
     def add_spectrum_graph(self, data, title, graph_index):
@@ -196,25 +229,21 @@ class FWHMAnalyzerApp:
         button_frame = ttk.Frame(graph_frame)
         button_frame.pack(side=tk.RIGHT, padx=10, anchor='center')
         
-        analyze_button = ttk.Button(button_frame, text="② 解析開始", command=lambda idx=graph_index: self.start_analysis_for(idx))
+        analyze_button = ttk.Button(button_frame, text="② Start Analysis", command=lambda idx=graph_index: self.start_analysis_for(idx))
         analyze_button.pack(pady=5)
         
-        status_label = ttk.Label(button_frame, text="未処理", foreground="red")
+        status_label = ttk.Label(button_frame, text="Not Processed", foreground="red")
         status_label.pack(pady=5)
         
-        # --- 変更点：フレームにラベルを直接関連付けるのではなく、辞書で管理 ---
         self.graph_frames[graph_index] = {'frame': graph_frame, 'status_label': status_label}
 
-    # --- 変更点：データとフレームの参照方法を安全な形に修正 ---
     def start_analysis_for(self, graph_index):
         try:
-            # 安全なデータ検索
             spectrum_info = next(item for item in self.spectrum_files_data if item['original_index'] == graph_index)
-            # 安全なフレームとラベルの取得
             graph_widgets = self.graph_frames[graph_index]
             status_label = graph_widgets['status_label']
         except (StopIteration, KeyError):
-            messagebox.showerror("内部エラー", f"インデックス '{graph_index}' のデータまたはグラフが見つかりません。")
+            messagebox.showerror("Internal Error", f"Could not find data or graph for index '{graph_index}'.")
             return
             
         raw_data = spectrum_info['data']
@@ -222,7 +251,7 @@ class FWHMAnalyzerApp:
         
         graph_save_path = os.path.join(self.output_graph_dir, f"filter_{filter_num}_result.png")
         
-        dialog = AnalysisWindow(self.master, raw_data, f"詳細解析: Filter {filter_num}", graph_save_path)
+        dialog = AnalysisWindow(self.master, raw_data, f"Detailed Analysis: Filter {filter_num}", graph_save_path)
         self.master.wait_window(dialog.top)
 
         if dialog.fwhm_result is not None and not np.isnan(dialog.fwhm_result):
@@ -231,7 +260,7 @@ class FWHMAnalyzerApp:
             status_color = "green"
         else:
             self.fwhm_results[graph_index] = np.nan
-            status_text = "スキップ"
+            status_text = "Skipped"
             status_color = "orange"
             
         status_label.config(text=status_text, foreground=status_color)
@@ -243,33 +272,32 @@ class FWHMAnalyzerApp:
         initial_file = f"{base_name.replace('_after', '')}_after_after.xlsx"
 
         output_path = filedialog.asksaveasfilename(
-            title="結果を保存",
+            title="Save Results",
             filetypes=[("Excel files", "*.xlsx")],
             defaultextension=".xlsx",
             initialfile=initial_file
         )
         if not output_path: return
 
-        # fwhm_resultsのキーは元のDataFrameのインデックスなので、reindexで正しく結合される
         fwhm_series = pd.Series(self.fwhm_results, name="FWHM (nm)").reindex(self.df_results.index)
         final_df = self.df_results.join(fwhm_series)
         
         try:
             final_df.to_excel(output_path, index=False)
-            messagebox.showinfo("成功", f"結果を '{os.path.basename(output_path)}' に保存しました。\nグラフ画像は 'FWHM_Analysis_Graphs' フォルダを確認してください。")
+            messagebox.showinfo("Success", f"Results saved to '{os.path.basename(output_path)}'.\nGraph images are in the 'FWHM_Analysis_Graphs' folder.")
         except Exception as e:
-            messagebox.showerror("エラー", f"ファイルの保存に失敗しました: {e}")
+            messagebox.showerror("Error", f"Failed to save file: {e}")
 
 class AnalysisWindow:
     def __init__(self, parent, data, title, save_path):
         self.top = tk.Toplevel(parent)
         self.top.title(title)
         self.top.geometry("800x600")
-        self.top.protocol("WM_DELETE_WINDOW", self.on_skip) # Xボタンで閉じたらスキップ扱い
+        self.top.protocol("WM_DELETE_WINDOW", self.on_skip)
 
         self.data = data
         self.save_path = save_path
-        self.fwhm_result = None
+        self.fwhm_result = np.nan # Default to NaN
 
         self.x, self.y_raw = self.data[:, 0], self.data[:, 1]
         
@@ -300,8 +328,8 @@ class AnalysisWindow:
         
         button_frame = ttk.Frame(self.top, padding=5)
         button_frame.pack()
-        ttk.Button(button_frame, text="この結果を承認", command=self.on_approve).pack(side=tk.LEFT, padx=10)
-        ttk.Button(button_frame, text="スキップ", command=self.on_skip).pack(side=tk.LEFT, padx=10)
+        ttk.Button(button_frame, text="Approve this Result", command=self.on_approve).pack(side=tk.LEFT, padx=10)
+        ttk.Button(button_frame, text="Skip", command=self.on_skip).pack(side=tk.LEFT, padx=10)
         
         self.update_fit((self.x.min(), self.x.max()))
 
@@ -322,12 +350,12 @@ class AnalysisWindow:
             peak_idx = np.argmax(y_fit)
             amplitude0 = y_fit[peak_idx]
             center0 = x_fit[peak_idx]
-            half_max = amplitude0 / 2.0
             try:
+                half_max = amplitude0 / 2.0
                 left_idx = (np.abs(y_fit[:peak_idx] - half_max)).argmin()
                 right_idx = (np.abs(y_fit[peak_idx:] - half_max)).argmin() + peak_idx
                 fwhm0 = x_fit[right_idx] - x_fit[left_idx]
-            except ValueError:
+            except (ValueError, IndexError):
                 fwhm0 = (x_fit[-1] - x_fit[0]) / 2.0
             if fwhm0 <= 0: fwhm0 = (x_fit[-1] - x_fit[0]) / 2.0
             eta0 = 0.5
@@ -350,22 +378,22 @@ class AnalysisWindow:
 
     def on_approve(self):
         if self.fwhm_result is None or np.isnan(self.fwhm_result):
-            messagebox.showwarning("承認不可", "FWHMが有効に計算できていません。", parent=self.top)
+            messagebox.showwarning("Approval Failed", "A valid FWHM has not been calculated.", parent=self.top)
             return
         self.save_figure()
         self.top.destroy()
 
     def on_skip(self):
-        self.fwhm_result = np.nan # スキップはNaNとして記録
+        self.fwhm_result = np.nan
         self.save_figure()
         self.top.destroy()
         
     def save_figure(self):
         try:
             self.fig.savefig(self.save_path, dpi=150)
-            print(f"グラフを保存しました: {self.save_path}")
+            print(f"Graph saved to: {self.save_path}")
         except Exception as e:
-            messagebox.showwarning("グラフ保存エラー", f"グラフの保存に失敗しました:\n{e}", parent=self.top)
+            messagebox.showwarning("Graph Save Error", f"Failed to save graph:\n{e}", parent=self.top)
 
 if __name__ == "__main__":
     root = tk.Tk()
