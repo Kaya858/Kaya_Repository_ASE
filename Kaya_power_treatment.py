@@ -1,157 +1,407 @@
 import tkinter as tk
-from tkinter import filedialog, simpledialog, messagebox
+from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 import numpy as np
+import ruptures as rpt
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+# ★変更点: scikit-learnをインポート
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
-# --- 設定項目 ---
-# グラフの見た目など、お好みで変更してください
-FIG_SIZE = (12, 8)  # グラフウィンドウのサイズ (横, 縦)
-ORIGINAL_DATA_COLOR = 'skyblue' # 元データの線の色
-AVERAGED_LINE_COLOR = 'red' # 平均化した線の色
-SEPARATOR_LINE_COLOR = 'gray' # 区切り線の色
-FILTER_NUMBER_COLOR = 'black' # NDフィルタ番号の色
+# --- 定数 ---
+class Config:
+    FIG_SIZE = (10, 8)
+    RAW_DATA_COLOR = 'lightgray'
+    PROCESSED_DATA_COLOR = 'skyblue'
+    STAIR_LINE_COLOR = 'coral'
+    STAIR_LINE_SELECTED_COLOR = 'red'
+    TRANSITION_AREA_COLOR = 'gray'
+    SEPARATOR_LINE_COLOR = 'gray'
+    LOG_CLIP_VALUE = 1e-9
+    MIN_SEGMENT_LEN = 5
+    FILTER_CYCLE = 36
+    GRADIENT_THRESHOLD_FACTOR = 1.5 # K-Means分類を使用する場合、この値は使われない
 
-class ParameterDialog(simpledialog.Dialog):
-    """NDフィルタのパラメータを入力するためのカスタムダイアログ"""
-    def body(self, master):
-        tk.Label(master, text="最初のNDフィルタ番号:").grid(row=0, sticky="w")
-        tk.Label(master, text="NDフィルタのステップ:").grid(row=1, sticky="w")
+# ==============================================================================
+# MODEL: データとビジネスロジックを管理
+# ==============================================================================
+class AnalysisModel:
+    def __init__(self):
+        self.filepath = ""
+        self.y_data_raw = None
+        self.y_data = None
+        self.x_data = None
+        self.segments = []
+        self.boundaries = []
+        self.filter_params = {'start': 1, 'step': 1}
+        self.selected_segment_id = -1
 
-        self.e1 = tk.Entry(master)
-        self.e2 = tk.Entry(master)
+    def load_data(self, filepath: str):
+        self.filepath = filepath
+        self.y_data_raw = pd.read_csv(filepath, sep=';', header=None, usecols=[1], names=['intensity'])['intensity']
+        self.x_data = np.arange(len(self.y_data_raw))
+        self.selected_segment_id = -1
+        self.segments = []
+        self.boundaries = []
 
-        # 初期値を入力しておく
-        self.e1.insert(0, "22")
-        self.e2.insert(0, "2")
+    def process_data(self, use_smoothing: bool, window_size: int):
+        if use_smoothing and window_size >= 2:
+            smoothed = self.y_data_raw.rolling(window=window_size, center=True).mean()
+            self.y_data = smoothed.fillna(method='bfill').fillna(method='ffill')
+        else:
+            self.y_data = self.y_data_raw.copy()
+
+    # ★変更点1: ペナルティ関数を指数関数的に変更
+    def _analyze_with_variable_penalty(self, signal, model, chunk_size, start_penalty, end_penalty):
+        """
+        可変ペナルティを用いて変化点を検出する内部メソッド（チャンク分割解析）。
+        ペナルティの増加カーブを指数関数的に変更。
+        """
+        n_samples = len(signal)
         
-        self.e1.grid(row=0, column=1)
-        self.e2.grid(row=1, column=1)
+        # 対数スケールでペナルティを計算することで、指数関数的な増加を実現
+        # 小さな値に対応するため、ペナルティが0以下にならないように下限を設定
+        log_start_penalty = np.log(max(start_penalty, 1e-9))
+        log_end_penalty = np.log(max(end_penalty, 1e-9))
         
-        # 最初の入力欄にフォーカスを合わせる
-        return self.e1
+        # xの位置(0-1)に応じて、対数スケール上で線形補間した値を指数に戻す関数
+        penalty_func = lambda x: np.exp(log_start_penalty + (log_end_penalty - log_start_penalty) * (x / n_samples))
 
-    def apply(self):
-        try:
-            start_num = int(self.e1.get())
-            step_num = int(self.e2.get())
-            self.result = start_num, step_num
-        except ValueError:
-            messagebox.showwarning("入力エラー", "有効な整数を入力してください。")
-            self.result = None
-
-def get_nd_filter_number(base_num, index, step):
-    """
-    NDフィルタの番号を計算する関数。36の次は1になるルールを適用。
-    """
-    num = base_num + index * step
-    if num > 0:
-        return (num - 1) % 36 + 1
-    else:
-        while num <= 0:
-            num += 36
-        return num
-
-def main():
-    """
-    メインの処理を行う関数
-    """
-    # 1. Tkinterのルートウィンドウを作成し、非表示にする
-    root = tk.Tk()
-    root.withdraw()
-
-    # 2. ファイル選択ダイアログを表示して、ファイルパスを取得
-    filepath = filedialog.askopenfilename(
-        title="データファイルを選択してください",
-        filetypes=[("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")]
-    )
-    if not filepath:
-        print("ファイルが選択されませんでした。プログラムを終了します。")
-        return
-
-    # 3. GUIでパラメータを入力させる
-    dialog = ParameterDialog(root, title="パラメータ入力")
-    if dialog.result is None:
-        print("パラメータが入力されませんでした。プログラムを終了します。")
-        return
-    start_filter_num, filter_step = dialog.result
-
-    # 4. データを読み込む
-    try:
-        data = pd.read_csv(filepath, sep=';', header=None, usecols=[1], names=['intensity'])
-        y_data = data['intensity']
-        x_data = np.arange(len(y_data))
-    except Exception as e:
-        print(f"ファイルの読み込み中にエラーが発生しました: {e}")
-        messagebox.showerror("ファイルエラー", f"ファイルの読み込み中にエラーが発生しました:\n{e}")
-        return
-
-    # 5. グラフとスライダーの準備
-    fig, ax = plt.subplots(figsize=FIG_SIZE)
-    plt.subplots_adjust(bottom=0.25)
-
-    initial_step_size = 100
-    min_step_size = 1
-    max_step_size = len(y_data) // 2
-    
-    ax_slider = plt.axes([0.2, 0.1, 0.65, 0.03])
-    step_slider = Slider(
-        ax=ax_slider,
-        label='1段あたりのデータ点数',
-        valmin=min_step_size,
-        valmax=max_step_size,
-        valinit=initial_step_size,
-        valstep=1
-    )
-
-    # 6. グラフを更新する関数
-    def update(val):
-        ax.clear()
-        step_size = int(step_slider.val)
-
-        ax.plot(x_data, y_data, label='元のデータ', color=ORIGINAL_DATA_COLOR, zorder=1)
-
-        num_steps = len(y_data) // step_size
-        for i in range(num_steps):
-            start_index = i * step_size
-            end_index = (i + 1) * step_size
-            segment = y_data[start_index:end_index]
+        all_bkps = set()
+        
+        for start in range(0, n_samples, chunk_size):
+            end = min(start + chunk_size + (chunk_size // 4), n_samples)
+            chunk_signal = signal[start:end]
             
-            if segment.empty: continue
+            mid_point = start + len(chunk_signal) // 2
+            current_penalty = penalty_func(mid_point)
             
-            avg_value = segment.mean()
-            
-            ax.hlines(y=avg_value, xmin=start_index, xmax=end_index-1, 
-                      color=AVERAGED_LINE_COLOR, linestyle='-', linewidth=2.5, zorder=3)
-            
-            if i > 0:
-                ax.axvline(x=start_index, color=SEPARATOR_LINE_COLOR, linestyle='--', linewidth=1, zorder=2)
+            algo = rpt.Pelt(model=model, min_size=Config.MIN_SEGMENT_LEN).fit(chunk_signal.values)
+            try:
+                bkps_in_chunk = algo.predict(pen=current_penalty)
+                adjusted_bkps = [b + start for b in bkps_in_chunk if b < len(chunk_signal)]
+                all_bkps.update(adjusted_bkps)
+            except Exception:
+                continue
                 
-            filter_num = get_nd_filter_number(start_filter_num, i, filter_step)
-            text_x = start_index + step_size / 2
-            text_y = avg_value + (y_data.max() - y_data.min()) * 0.05
-            ax.text(text_x, text_y, f'ND: {filter_num}', ha='center', color=FILTER_NUMBER_COLOR, 
-                    bbox=dict(facecolor='white', alpha=0.5, edgecolor='none', boxstyle='round,pad=0.2'))
+        return sorted(list(all_bkps))
 
-        ax.set_title(f'データ解析結果 (1段あたり {step_size} 点)')
-        ax.set_xlabel('データポイントのインデックス')
-        ax.set_ylabel('光の強度 (μJ)')
-        ax.legend()
-        ax.grid(True, linestyle=':', alpha=0.6)
+    # ★変更点2: K-Meansによるセグメント分類ロジックに置き換え
+    def analyze_segments(self, use_log, model, use_classification, gradient_threshold_factor,
+                         chunk_size, start_penalty, end_penalty):
+        if self.y_data is None: raise ValueError("データが処理されていません。")
+
+        signal = np.log1p(self.y_data.clip(lower=Config.LOG_CLIP_VALUE)) if use_log else self.y_data.copy()
         
-        ax.set_ylim(y_data.min() * 0.95, y_data.max() * 1.1)
+        # --- ステージ1: 可変ペナルティによる変化点検出 ---
+        bkps = self._analyze_with_variable_penalty(signal, model, chunk_size, start_penalty, end_penalty)
+        
+        boundaries = [0] + bkps
+        if not boundaries or boundaries[-1] != len(signal): boundaries.append(len(signal))
 
-        fig.canvas.draw_idle()
+        segments = []
+        for i in range(len(boundaries) - 1):
+            start, end = boundaries[i], boundaries[i+1]
+            if start >= end: continue
+            log_data = signal.iloc[start:end]
+            segments.append({
+                'id': i, 'start': start, 'end': end, 'len': len(log_data),
+                'log_avg': log_data.mean() if not log_data.empty else 0
+            })
 
-    # 7. スライダーのイベントと関数を接続
-    step_slider.on_changed(update)
+        # --- ステージ2 & 3: K-Meansによる分類と結合 ---
+        if use_classification and len(segments) > 1:
+            # 特徴量（標準偏差、傾き）を計算
+            for seg in segments:
+                seg_data = signal.iloc[seg['start']:seg['end']]
+                seg['std_dev'] = seg_data.std() if len(seg_data) > 1 else 0
+                if len(seg_data) > 1:
+                    gradient = np.polyfit(np.arange(len(seg_data)), seg_data, 1)[0]
+                    seg['gradient'] = np.abs(gradient)
+                else:
+                    seg['gradient'] = 0
 
-    # 8. 初回描画
-    update(initial_step_size)
+            # K-Meansで2つのクラスタに分類
+            feature_matrix = pd.DataFrame([{'std_dev': s['std_dev'], 'gradient': s['gradient']} for s in segments])
+            scaler = StandardScaler()
+            scaled_features = scaler.fit_transform(feature_matrix)
+            kmeans = KMeans(n_clusters=2, random_state=42, n_init='auto')
+            labels = kmeans.fit_predict(scaled_features)
 
-    # 9. グラフを表示
-    plt.show()
+            # 標準偏差が小さいクラスタを「Stair」と判断
+            cluster_centers_std = scaler.inverse_transform(kmeans.cluster_centers_)[:, 0]
+            stair_cluster_label = np.argmin(cluster_centers_std)
+            
+            for seg, label in zip(segments, labels):
+                seg['type'] = 'Stair' if label == stair_cluster_label else 'Transition'
 
+            if segments:
+                segments[0]['type'] = 'Stair'
+
+            # 同じタイプの隣接セグメントを結合
+            i = 0
+            while i < len(segments) - 1:
+                s1, s2 = segments[i], segments[i+1]
+                if s1['type'] == s2['type']:
+                    s1['end'] = s2['end']
+                    s1['len'] = s1['end'] - s1['start']
+                    merged_log_data = signal.iloc[s1['start']:s1['end']]
+                    s1['log_avg'] = merged_log_data.mean() if not merged_log_data.empty else 0
+                    s1['std_dev'] = merged_log_data.std() if len(merged_log_data) > 1 else 0
+                    if len(merged_log_data) > 1:
+                         gradient = np.polyfit(np.arange(len(merged_log_data)), merged_log_data, 1)[0]
+                         s1['gradient'] = np.abs(gradient)
+                    else:
+                         s1['gradient'] = 0
+                    segments.pop(i + 1)
+                    continue
+                i += 1
+        else:
+            for seg in segments:
+                seg['type'] = 'Stair'
+
+        # --- 最終化処理 ---
+        for idx, seg in enumerate(segments): seg['id'] = idx
+        for seg in segments: seg['avg'] = self.y_data.iloc[seg['start']:seg['end']].mean()
+        self._assign_nd_numbers(segments)
+        self.segments = segments
+        self.boundaries = [s['start'] for s in self.segments] + ([self.segments[-1]['end']] if self.segments else [])
+
+    def _assign_nd_numbers(self, segments):
+        stair_counter = 0
+        for seg in segments:
+            if seg['type'] == 'Stair':
+                num = self.filter_params['start'] + (stair_counter * self.filter_params['step'])
+                seg['filter_num'] = self._normalize_filter_num(num)
+                stair_counter += 1
+            else:
+                seg['filter_num'] = None
+
+    def _normalize_filter_num(self, num: int) -> int:
+        if num > 0: return (num - 1) % Config.FILTER_CYCLE + 1
+        return (num - 1 + Config.FILTER_CYCLE * (abs(num) // Config.FILTER_CYCLE + 1)) % Config.FILTER_CYCLE + 1
+
+# ==============================================================================
+# VIEW: UIの構築と表示を担当
+# ==============================================================================
+class AnalysisView:
+    def __init__(self, root: tk.Tk, controller):
+        self.root = root; self.controller = controller
+        self.root.title("Step Data Analyzer v12.0 (Robust)")
+
+        self.filepath_var = tk.StringVar()
+        self.start_filter_var = tk.StringVar(value="1")
+        self.filter_step_var = tk.StringVar(value="1")
+        self.use_smoothing_var = tk.BooleanVar(value=False)
+        self.smoothing_window_var = tk.StringVar(value="5")
+        self.use_log_transform_var = tk.BooleanVar(value=True)
+        self.use_classification_var = tk.BooleanVar(value=True)
+        self.detection_model_var = tk.StringVar(value="l2")
+        self.gradient_factor_var = tk.StringVar(value=str(Config.GRADIENT_THRESHOLD_FACTOR))
+        
+        self.start_penalty_var = tk.StringVar(value="5.0")
+        self.end_penalty_var = tk.StringVar(value="50.0")
+        self.chunk_size_var = tk.StringVar(value="500")
+
+        self._create_main_layout()
+    
+    def _create_main_layout(self):
+        paned_window = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        paned_window.pack(fill="both", expand=True, padx=10, pady=10)
+        control_frame = ttk.Frame(paned_window, width=400)
+        self._create_control_panel(control_frame)
+        paned_window.add(control_frame, weight=1)
+        graph_frame = ttk.Frame(paned_window, width=800)
+        self._create_graph_panel(graph_frame)
+        paned_window.add(graph_frame, weight=3)
+    
+    def _create_control_panel(self, parent: ttk.Frame):
+        parent.grid_rowconfigure(1, weight=1); parent.grid_columnconfigure(0, weight=1)
+        params_frame = ttk.LabelFrame(parent, text="Parameters", padding="10")
+        params_frame.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
+        self._create_parameter_inputs(params_frame)
+        segments_frame = ttk.LabelFrame(parent, text="Detected Stair Segments", padding="10")
+        segments_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+        self._create_segment_list(segments_frame)
+
+    def _create_parameter_inputs(self, parent: ttk.LabelFrame):
+        parent.columnconfigure(1, weight=1)
+        
+        ttk.Label(parent, text="Data File:").grid(row=0, column=0, columnspan=3, sticky="w", pady=2)
+        ttk.Entry(parent, textvariable=self.filepath_var).grid(row=1, column=0, columnspan=2, sticky="ew")
+        ttk.Button(parent, text="Browse...", command=self.controller.browse_file).grid(row=1, column=2, padx=(5,0))
+
+        filter_frame = ttk.LabelFrame(parent, text="Filter Numbering (for Stairs)", padding="5")
+        filter_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10,0))
+        ttk.Label(filter_frame, text="Start Number:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(filter_frame, textvariable=self.start_filter_var, width=10).grid(row=0, column=1, sticky="w")
+        ttk.Label(filter_frame, text="Step:").grid(row=1, column=0, sticky="w", pady=(0,2))
+        ttk.Entry(filter_frame, textvariable=self.filter_step_var, width=10).grid(row=1, column=1, sticky="w")
+
+        adv_frame = ttk.LabelFrame(parent, text="Analysis Settings", padding="5")
+        adv_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10,0))
+        adv_frame.columnconfigure(1, weight=1)
+
+        ttk.Checkbutton(adv_frame, text="Apply Smoothing", variable=self.use_smoothing_var, command=self.controller.toggle_smoothing_entry).grid(row=0, column=0, sticky="w", columnspan=2)
+        ttk.Label(adv_frame, text="Window:").grid(row=0, column=2, sticky="w", padx=(5,0))
+        self.smoothing_window_entry = ttk.Entry(adv_frame, textvariable=self.smoothing_window_var, width=8, state="disabled")
+        self.smoothing_window_entry.grid(row=0, column=3, sticky="w", padx=2)
+
+        ttk.Checkbutton(adv_frame, text="Use Log Transform (Recommended)", variable=self.use_log_transform_var).grid(row=1, column=0, columnspan=4, sticky="w")
+        ttk.Checkbutton(adv_frame, text="Distinguish & Merge Segments", variable=self.use_classification_var).grid(row=2, column=0, columnspan=4, sticky="w")
+        
+        ttk.Label(adv_frame, text="Model:").grid(row=3, column=0, sticky="w", pady=2)
+        ttk.OptionMenu(adv_frame, self.detection_model_var, "l2", "l2", "rbf").grid(row=3, column=1, sticky="w")
+        
+        pen_frame = ttk.LabelFrame(adv_frame, text="Variable Penalty Settings", padding=5)
+        pen_frame.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10,0))
+        ttk.Label(pen_frame, text="Start Penalty:").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Entry(pen_frame, textvariable=self.start_penalty_var, width=10).grid(row=0, column=1, sticky="w")
+        ttk.Label(pen_frame, text="End Penalty:").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Entry(pen_frame, textvariable=self.end_penalty_var, width=10).grid(row=1, column=1, sticky="w")
+        ttk.Label(pen_frame, text="Chunk Size:").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Entry(pen_frame, textvariable=self.chunk_size_var, width=10).grid(row=2, column=1, sticky="w")
+        
+        # K-Means導入によりこのパラメータは使われませんが、UIの互換性のために残しています
+        ttk.Label(adv_frame, text="Gradient Threshold (unused):").grid(row=5, column=0, sticky="w", pady=2, columnspan=2)
+        ttk.Entry(adv_frame, textvariable=self.gradient_factor_var, width=10).grid(row=5, column=2, sticky="w", columnspan=2)
+
+        ttk.Button(parent, text="Run Analysis", command=self.controller.run_analysis, style="Accent.TButton").grid(row=4, column=0, columnspan=3, pady=(15,5), sticky="ew")
+
+    def get_ui_parameters(self) -> dict:
+        try:
+            return {
+                "filepath": self.filepath_var.get(), 
+                "start_filter": int(self.start_filter_var.get()),
+                "filter_step": int(self.filter_step_var.get()), 
+                "use_smoothing": self.use_smoothing_var.get(),
+                "smoothing_window": int(self.smoothing_window_var.get()), 
+                "use_log": self.use_log_transform_var.get(),
+                "use_classification": self.use_classification_var.get(), 
+                "model": self.detection_model_var.get(),
+                "gradient_threshold_factor": float(self.gradient_factor_var.get()),
+                "start_penalty": float(self.start_penalty_var.get()),
+                "end_penalty": float(self.end_penalty_var.get()),
+                "chunk_size": int(self.chunk_size_var.get())
+            }
+        except (ValueError, TypeError) as e:
+            self.show_error("Invalid Parameter", f"パラメータを確認してください。\n詳細: {e}")
+            return None
+    
+    def _create_segment_list(self, parent: ttk.Frame):
+        parent.grid_rowconfigure(0, weight=1); parent.grid_columnconfigure(0, weight=1)
+        canvas = tk.Canvas(parent, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        self.scrollable_frame = ttk.Frame(canvas)
+        self.scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew"); scrollbar.grid(row=0, column=1, sticky="ns")
+
+    def _create_graph_panel(self, parent: ttk.Frame):
+        self.fig, self.ax = plt.subplots(figsize=Config.FIG_SIZE, tight_layout=True)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=parent)
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        toolbar = NavigationToolbar2Tk(self.canvas, parent); toolbar.update()
+        self.ax.set_title('Step Data Analysis'); self.canvas.draw()
+
+    def redraw_plot(self, model: AnalysisModel):
+        self.ax.clear()
+        if model.y_data_raw is not None:
+            self.ax.plot(model.x_data, model.y_data_raw, label='Raw Data', color=Config.RAW_DATA_COLOR, alpha=0.8, zorder=1)
+        if model.y_data is not None:
+            self.ax.plot(model.x_data, model.y_data, label="Processed Data", color=Config.PROCESSED_DATA_COLOR, zorder=2)
+
+        for seg in model.segments:
+            if seg['type'] == 'Stair':
+                is_selected = (seg['id'] == model.selected_segment_id)
+                color = Config.STAIR_LINE_SELECTED_COLOR if is_selected else Config.STAIR_LINE_COLOR
+                self.ax.hlines(y=seg['avg'], xmin=seg['start'], xmax=seg['end']-1, color=color, linestyle='-', linewidth=2.5, zorder=4)
+                if seg.get('filter_num') and model.y_data is not None:
+                    y_range = self.ax.get_ylim()[1] - self.ax.get_ylim()[0]
+                    y_offset = y_range * 0.05
+                    self.ax.text((seg['start'] + seg['end']) / 2, seg['avg'] + y_offset, f"ND:{seg['filter_num']}", ha='center',
+                                 bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', boxstyle='round,pad=0.2'))
+            elif seg['type'] == 'Transition':
+                self.ax.axvspan(seg['start'], seg['end'], color=Config.TRANSITION_AREA_COLOR, alpha=0.3, zorder=0)
+
+        for b in model.boundaries[1:-1]:
+            self.ax.axvline(x=b, color=Config.SEPARATOR_LINE_COLOR, linestyle='--', linewidth=1, zorder=3)
+
+        self.ax.set_title('Step Data Analysis Results'); self.ax.set_xlabel('Data Point Index'); self.ax.set_ylabel('Intensity (μJ)')
+        self.ax.legend(loc='upper right'); self.ax.grid(True, linestyle=':', alpha=0.6)
+        if model.y_data is not None and not model.y_data.empty:
+            self.ax.set_ylim(bottom=0, top=model.y_data.max() * 1.15)
+        self.canvas.draw_idle()
+
+    def update_segment_buttons(self, model: AnalysisModel):
+        for widget in self.scrollable_frame.winfo_children(): widget.destroy()
+        style = ttk.Style(); style.configure("SelectedSegment.TButton", borderwidth=2, relief="sunken")
+        for s in model.segments:
+            if s['type'] == 'Stair':
+                btn_text = f"ND: {s.get('filter_num', 'N/A'):<2} | Avg: {s['avg']:.3f} μJ"
+                btn = ttk.Button(self.scrollable_frame, text=btn_text, command=lambda sid=s['id']: self.controller.select_segment(sid))
+                btn.pack(fill='x', padx=5, pady=2)
+                if s['id'] == model.selected_segment_id: btn.config(style="SelectedSegment.TButton")
+    
+    def show_error(self, title: str, message: str): messagebox.showerror(title, message)
+    def show_info(self, title: str, message: str): messagebox.showinfo(title, message)
+
+# ==============================================================================
+# CONTROLLER: ViewとModelを仲介
+# ==============================================================================
+class AnalysisController:
+    def __init__(self, root: tk.Tk):
+        self.model = AnalysisModel()
+        self.view = AnalysisView(root, self)
+        self.view.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        s = ttk.Style(); s.configure('Accent.TButton', font=('calibri', 10, 'bold'), foreground='white', background='#0078D7')
+
+    def on_closing(self): plt.close('all'); self.view.root.destroy()
+
+    def run_analysis(self):
+        params = self.view.get_ui_parameters()
+        if params is None: return
+        try:
+            if not params['filepath']: raise ValueError("データファイルが選択されていません。")
+            self.model.filter_params = {'start': params['start_filter'], 'step': params['filter_step']}
+            self.model.load_data(params['filepath'])
+            self.model.process_data(params['use_smoothing'], params['smoothing_window'])
+            self.model.analyze_segments(
+                use_log=params['use_log'], 
+                model=params['model'],
+                use_classification=params['use_classification'],
+                gradient_threshold_factor=params['gradient_threshold_factor'],
+                chunk_size=params['chunk_size'],
+                start_penalty=params['start_penalty'],
+                end_penalty=params['end_penalty']
+            )
+            self.view.redraw_plot(self.model)
+            self.view.update_segment_buttons(self.model)
+            num_stairs = len([s for s in self.model.segments if s['type'] == 'Stair'])
+            self.view.show_info("Analysis Complete", f"{num_stairs} stair segments were detected.")
+        except Exception as e:
+            self.view.show_error("Analysis Error", f"解析中にエラーが発生しました:\n{e}")
+            self.model = AnalysisModel(); self.view.redraw_plot(self.model); self.view.update_segment_buttons(self.model)
+
+    def browse_file(self):
+        path = filedialog.askopenfilename(title="Select a Data File", filetypes=[("CSV files", "*.csv"), ("Text files", "*.txt"), ("All files", "*.*")])
+        if path: self.view.filepath_var.set(path)
+
+    def toggle_smoothing_entry(self):
+        self.view.smoothing_window_entry.config(state="normal" if self.view.use_smoothing_var.get() else "disabled")
+
+    def select_segment(self, seg_id: int):
+        self.model.selected_segment_id = -1 if self.model.selected_segment_id == seg_id else seg_id
+        self.view.redraw_plot(self.model)
+        self.view.update_segment_buttons(self.model)
+
+# ==============================================================================
+# アプリケーションの実行
+# ==============================================================================
 if __name__ == '__main__':
-    main()
+    root = tk.Tk()
+    root.geometry("1250x850")
+    app = AnalysisController(root)
+    root.mainloop()
