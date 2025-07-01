@@ -5,9 +5,21 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Matplotlibのインポート文を修正
+# Matplotlibのインポート
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.backends._backend_tk import NavigationToolbar2Tk
+
+# 自動推定機能のためのインポート
+try:
+    from skimage.filters import threshold_otsu
+except ImportError:
+    messagebox.showerror(
+        "ライブラリ不足",
+        "scikit-imageがインストールされていません。\nターミナルで 'pip install scikit-image' を実行してください。"
+    )
+    # 依存ライブラリがない場合は終了
+    import sys
+    sys.exit()
 
 # --- 定数 ---
 class Config:
@@ -44,21 +56,20 @@ class AnalysisModel:
         self.selected_segment_id = -1
         self.segments = []
         self.boundaries = []
+        # 新しいデータをロードしたら、既存の処理済みデータをクリア
+        self.y_data = None
 
     def process_data(self, use_smoothing: bool, window_size: int):
+        if self.y_data_raw is None: return
         if use_smoothing and window_size >= 2:
             smoothed = self.y_data_raw.rolling(window=window_size, center=True).mean()
             self.y_data = smoothed.fillna(method='bfill').fillna(method='ffill')
         else:
             self.y_data = self.y_data_raw.copy()
 
-    ### 変更点 ###
-    # analyze_by_gradient の引数を sensitivity に変更
     def analyze_by_gradient(self, sensitivity: float) -> tuple[list, dict]:
         if self.y_data is None: raise ValueError("データが処理されていません。")
 
-        # sensitivity (1.0-10.0) から high/low factorを計算
-        # 値が大きいほど敏感（factorが小さく）になるように設定
         high_factor = 1.0 + (11.0 - sensitivity) * 0.4
         low_factor = high_factor / 3.0
 
@@ -70,8 +81,7 @@ class AnalysisModel:
         median_grad = np.median(processed_gradient)
         mad = np.median(np.abs(processed_gradient - median_grad))
         robust_std = mad * 1.4826 + 1e-9
-
-        # 計算したfactorで閾値を設定
+        
         high_threshold = median_grad + high_factor * robust_std
         low_threshold = median_grad + low_factor * robust_std
 
@@ -96,6 +106,32 @@ class AnalysisModel:
         debug_data = {"processed_gradient": processed_gradient, "high_threshold": high_threshold, "low_threshold": low_threshold, "initial_labels": initial_labels, "y_data": self.y_data, "x_data": self.x_data}
         return initial_segments, debug_data
 
+    def estimate_optimal_sensitivity(self) -> float | None:
+        if self.y_data is None: return None
+
+        y_log = np.log1p(self.y_data)
+        gradient = np.abs(np.gradient(y_log))
+        log_local_mean = y_log.rolling(window=21, center=True, min_periods=1).mean()
+        damping_factor = np.median(log_local_mean) * 0.5
+        processed_gradient = gradient / (log_local_mean + damping_factor)
+        
+        if np.all(processed_gradient == processed_gradient[0]): return 5.0
+
+        ### ここを修正 ###
+        # pandas SeriesをNumPy Arrayに変換してから関数に渡す
+        otsu_threshold = threshold_otsu(processed_gradient.to_numpy())
+        
+        median_grad = np.median(processed_gradient)
+        mad = np.median(np.abs(processed_gradient - median_grad))
+        robust_std = mad * 1.4826 + 1e-9
+        
+        if robust_std < 1e-9 or otsu_threshold <= median_grad: return 1.0
+
+        estimated_high_factor = (otsu_threshold - median_grad) / robust_std
+        estimated_sensitivity = 11.0 - (estimated_high_factor - 1.0) / 0.4
+        
+        return np.clip(estimated_sensitivity, 1.0, 10.0)
+
     def run_cleanup_and_finalize(self):
         for _ in range(3):
             self._finalize_segments()
@@ -113,13 +149,14 @@ class AnalysisModel:
             i += 1
         for idx, seg in enumerate(self.segments):
             seg['id'] = idx
-            seg_data = self.y_data.iloc[seg['start']:seg['end']]
-            seg['avg'] = seg_data.mean() if not seg_data.empty else 0
+            if self.y_data is not None:
+                seg_data = self.y_data.iloc[seg['start']:seg['end']]
+                seg['avg'] = seg_data.mean() if not seg_data.empty else 0
         self._assign_nd_numbers(self.segments)
         self.boundaries = [s['start'] for s in self.segments] + ([self.segments[-1]['end']] if self.segments else [])
 
     def _cleanup_segments(self, min_stair_len: int = 20, min_transition_len: int = 3):
-        if len(self.segments) < 2: return
+        if len(self.segments) < 2 or self.y_data is None: return
         last_max_transition_size = None 
         i = 1
         while i < len(self.segments) - 1:
@@ -139,8 +176,7 @@ class AnalysisModel:
                     i = 0; continue
                 else:
                     current_size = abs(change)
-                    if last_max_transition_size is None: last_max_transition_size = current_size
-                    else: last_max_transition_size = max(last_max_transition_size, current_size)
+                    last_max_transition_size = max(last_max_transition_size or 0, current_size)
             i += 1
         i = 0
         while i < len(self.segments):
@@ -188,7 +224,7 @@ class AnalysisView:
     def __init__(self, root: tk.Tk, controller):
         self.root = root
         self.controller = controller
-        self.root.title("Step Data Analyzer v16.0") ### 変更点: バージョンアップ
+        self.root.title("Step Data Analyzer v17.1") # バージョンアップ
 
         self.filepath_var = tk.StringVar()
         self.start_filter_var = tk.StringVar(value="1")
@@ -196,8 +232,7 @@ class AnalysisView:
         self.use_smoothing_var = tk.BooleanVar(value=True)
         self.smoothing_window_var = tk.StringVar(value="15")
         
-        ### 変更点: 閾値関連の変数を「感度」に一本化 ###
-        self.sensitivity_var = tk.DoubleVar(value=5.0) # デフォルト値は5 (1-10の範囲)
+        self.sensitivity_var = tk.DoubleVar(value=5.0)
         self.sensitivity_str = tk.StringVar(value=f"{self.sensitivity_var.get():.1f}")
         
         self.edit_start_var = tk.IntVar()
@@ -206,20 +241,17 @@ class AnalysisView:
         self._create_main_layout()
         self._link_vars()
 
-    ### 変更点: 変数同期のロジックを感度用に変更 ###
     def _link_vars(self):
-        """感度スライダーと入力ボックスの値を同期させる"""
         def on_slider_change(val):
             self.sensitivity_str.set(f"{float(val):.1f}")
 
         def on_entry_change(*args):
             try:
                 val = float(self.sensitivity_str.get())
-                # スライダーの範囲内に値を収める
                 if 1.0 <= val <= 10.0:
                     self.sensitivity_var.set(val)
             except (ValueError, TypeError):
-                pass # 不正な値は無視
+                pass
 
         self.sensitivity_var.trace_add("write", lambda *args: on_slider_change(self.sensitivity_var.get()))
         self.sensitivity_str.trace_add("write", on_entry_change)
@@ -269,14 +301,14 @@ class AnalysisView:
         ttk.Label(filter_frame, text="Step:").grid(row=1, column=0, sticky="w", pady=(0,2))
         ttk.Entry(filter_frame, textvariable=self.filter_step_var, width=10).grid(row=1, column=1, sticky="w")
         
-        ### 変更点: 閾値設定UIを「感度」スライダーに変更 ###
         detection_frame = ttk.LabelFrame(parent, text="Detection Settings", padding=5)
         detection_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(10,0))
         detection_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(detection_frame, text="Sensitivity (鈍感 <-> 敏感):").grid(row=0, column=0, sticky="w")
+        ttk.Label(detection_frame, text="Sensitivity:").grid(row=0, column=0, sticky="w")
         ttk.Scale(detection_frame, from_=1.0, to=10.0, orient=tk.HORIZONTAL, variable=self.sensitivity_var).grid(row=0, column=1, sticky="ew", padx=5)
-        ttk.Entry(detection_frame, textvariable=self.sensitivity_str, width=5).grid(row=0, column=2)
+        ttk.Entry(detection_frame, textvariable=self.sensitivity_str, width=5).grid(row=0, column=2, sticky="w")
+        ttk.Button(detection_frame, text="Auto", command=self.controller.run_auto_estimation).grid(row=0, column=3, padx=(5, 0))
 
         ttk.Button(parent, text="Run Analysis", command=self.controller.run_analysis, style="Accent.TButton").grid(row=5, column=0, columnspan=3, pady=(15,5), sticky="ew")
 
@@ -296,14 +328,13 @@ class AnalysisView:
         ttk.Label(parent, textvariable=self.edit_end_label_var, width=5).grid(row=1, column=2)
         ttk.Button(parent, text="Apply Changes", command=self.controller.apply_segment_edit).grid(row=2, column=0, columnspan=3, sticky="ew", pady=5)
 
-    ### 変更点: パラメータ取得部分を sensitivity に対応 ###
-    def get_ui_parameters(self) -> dict:
+    def get_ui_parameters(self) -> dict | None:
         try:
             params = {
                 "filepath": self.filepath_var.get(),
                 "use_smoothing": self.use_smoothing_var.get(),
                 "smoothing_window": int(self.smoothing_window_var.get()),
-                "sensitivity": self.sensitivity_var.get(), # sensitivity を取得
+                "sensitivity": self.sensitivity_var.get(),
                 "start_filter": int(self.start_filter_var.get()),
                 "filter_step": int(self.filter_step_var.get())
             }
@@ -337,11 +368,11 @@ class AnalysisView:
             if seg['type'] == 'Stair':
                 is_selected = (seg['id'] == model.selected_segment_id)
                 color = Config.STAIR_LINE_SELECTED_COLOR if is_selected else Config.STAIR_LINE_COLOR
-                self.ax.hlines(y=seg['avg'], xmin=seg['start'], xmax=seg['end']-1, color=color, linestyle='-', linewidth=2.5, zorder=4)
-                if seg.get('filter_num') and model.y_data is not None:
+                self.ax.hlines(y=seg.get('avg', 0), xmin=seg['start'], xmax=seg['end']-1, color=color, linestyle='-', linewidth=2.5, zorder=4)
+                if seg.get('filter_num') and model.y_data is not None and len(self.ax.get_ylim()) == 2:
                     y_range = self.ax.get_ylim()[1] - self.ax.get_ylim()[0]
                     y_offset = y_range * 0.05
-                    self.ax.text((seg['start'] + seg['end']) / 2, seg['avg'] + y_offset, f"ND:{seg['filter_num']}", ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', boxstyle='round,pad=0.2'))
+                    self.ax.text((seg['start'] + seg['end']) / 2, seg.get('avg', 0) + y_offset, f"ND:{seg['filter_num']}", ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', boxstyle='round,pad=0.2'))
             elif seg['type'] == 'Transition': self.ax.axvspan(seg['start'], seg['end'], color=Config.TRANSITION_AREA_COLOR, alpha=0.3, zorder=0)
         for b in model.boundaries[1:-1]: self.ax.axvline(x=b, color=Config.SEPARATOR_LINE_COLOR, linestyle='--', linewidth=1, zorder=3)
         self.ax.set_title('Step Data Analysis Results'); self.ax.set_xlabel('Data Point Index'); self.ax.set_ylabel('Intensity (μJ)')
@@ -354,20 +385,20 @@ class AnalysisView:
         style = ttk.Style(); style.configure("SelectedSegment.TButton", borderwidth=2, relief="sunken")
         for s in model.segments:
             if s['type'] == 'Stair':
-                btn_text = f"ND: {s.get('filter_num', 'N/A'):<2} | Avg: {s['avg']:.3f} μJ"
+                btn_text = f"ND: {s.get('filter_num', 'N/A'):<2} | Avg: {s.get('avg', 0):.3f} μJ"
                 btn = ttk.Button(self.scrollable_frame, text=btn_text, command=lambda sid=s['id']: self.controller.select_segment(sid))
                 btn.pack(fill='x', padx=5, pady=2)
                 if s['id'] == model.selected_segment_id: btn.config(style="SelectedSegment.TButton")
 
     def update_segment_editor(self, model: AnalysisModel):
         seg_id = model.selected_segment_id
-        if seg_id == -1 or not(0 <= seg_id < len(model.segments)) or model.segments[seg_id]['type'] != 'Stair':
+        if not (0 <= seg_id < len(model.segments)) or model.segments[seg_id]['type'] != 'Stair':
             self.segment_edit_frame.grid_remove()
             return
         self.segment_edit_frame.grid()
         seg = model.segments[seg_id]
         min_start = model.segments[seg_id - 1]['start'] if seg_id > 0 else 0
-        max_end = model.segments[seg_id + 1]['end'] if seg_id < len(model.segments) - 1 else len(model.x_data)
+        max_end = model.segments[seg_id + 1]['end'] if seg_id < len(model.segments) - 1 and model.x_data is not None else (len(model.x_data) if model.x_data is not None else seg['end'])
         self.start_scale.config(from_=min_start, to=seg['end'] - 1)
         self.end_scale.config(from_=seg['start'] + 1, to=max_end)
         self.edit_start_var.set(seg['start'])
@@ -399,11 +430,11 @@ class AnalysisController:
         if params is None: return
         try:
             if not params['filepath']: raise ValueError("データファイルが選択されていません。")
+            if self.model.y_data is None: # データが未処理の場合のみロードと前処理
+                self.model.load_data(params['filepath'])
+                self.model.process_data(params['use_smoothing'], params['smoothing_window'])
+
             self.model.filter_params = {'start': params['start_filter'], 'step': params['filter_step']}
-            self.model.load_data(params['filepath'])
-            self.model.process_data(params['use_smoothing'], params['smoothing_window'])
-            
-            ### 変更点: sensitivity をモデルに渡す ###
             initial_segments, debug_data = self.model.analyze_by_gradient(params['sensitivity'])
             
             if Config.DEBUG_MODE: self._show_debug_plots(debug_data)
@@ -412,13 +443,8 @@ class AnalysisController:
             self.view.redraw_plot(self.model)
             self.view.update_segment_buttons(self.model)
             self.view.update_segment_editor(self.model)
-            num_stairs = len([s for s in self.model.segments if s['type'] == 'Stair'])
-            self.view.show_info("Analysis Complete", f"{num_stairs} stair segments were detected.")
         except Exception as e:
             self.view.show_error("Analysis Error", f"解析中にエラーが発生しました:\n{e}")
-            self.model = AnalysisModel()
-            self.view.redraw_plot(self.model)
-            self.view.update_segment_buttons(self.model)
 
     def _show_debug_plots(self, debug_data):
         if self.debug_fig is not None and plt.fignum_exists(self.debug_fig.number): plt.close(self.debug_fig)
@@ -438,7 +464,34 @@ class AnalysisController:
 
     def browse_file(self):
         path = filedialog.askopenfilename(title="Select a Data File", filetypes=[("CSV files", "*.csv"), ("Text files", "*.txt"), ("All files", "*.*")])
-        if path: self.view.filepath_var.set(path)
+        if path:
+            self.view.filepath_var.set(path)
+            # 新しいファイルが選択されたら、解析を一度実行してデータをロードする
+            try:
+                params = self.view.get_ui_parameters()
+                if not params: return
+                self.model.load_data(params['filepath'])
+                self.model.process_data(params['use_smoothing'], params['smoothing_window'])
+                self.run_analysis()
+                num_stairs = len([s for s in self.model.segments if s['type'] == 'Stair'])
+                self.view.show_info("Analysis Complete", f"{num_stairs} stair segments were detected.")
+            except Exception as e:
+                self.view.show_error("File Load Error", f"ファイルの読み込みまたは初期解析中にエラー:\n{e}")
+
+    def run_auto_estimation(self):
+        if self.model.y_data is None:
+            self.view.show_error("Error", "先に[Browse...]からデータファイルをロードしてください。")
+            return
+        try:
+            estimated_sensitivity = self.model.estimate_optimal_sensitivity()
+            if estimated_sensitivity is not None:
+                self.view.sensitivity_var.set(estimated_sensitivity)
+                self.run_analysis()
+                self.view.show_info("Auto Estimation", f"最適な感度 (約{estimated_sensitivity:.1f}) に設定しました。")
+            else:
+                self.view.show_error("Auto Estimation Failed", "感度の自動推定に失敗しました。")
+        except Exception as e:
+            self.view.show_error("Auto Estimation Error", f"自動推定中にエラーが発生しました:\n{e}")
 
     def select_segment(self, seg_id: int):
         self.model.selected_segment_id = -1 if self.model.selected_segment_id == seg_id else seg_id
@@ -465,11 +518,10 @@ class AnalysisController:
 if __name__ == '__main__':
     root = tk.Tk()
     root.geometry("1400x900")
-    # Sun Valley Theme (もしインストールされていれば)
     try:
         import sv_ttk
-        sv_ttk.set_theme("dark") # "light" or "dark"
+        sv_ttk.set_theme("dark")
     except ImportError:
-        pass # なければデフォルトテーマで実行
+        pass # Fallback to default theme
     app = AnalysisController(root)
     root.mainloop()
