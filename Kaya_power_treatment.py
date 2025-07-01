@@ -20,7 +20,6 @@ class Config:
     LOG_CLIP_VALUE = 1e-9
     MIN_SEGMENT_LEN = 5
     FILTER_CYCLE = 36
-    # ★新ロジック用のデフォルト係数
     GRADIENT_THRESHOLD_FACTOR = 3.0 
 
 # ==============================================================================
@@ -52,39 +51,27 @@ class AnalysisModel:
         else:
             self.y_data = self.y_data_raw.copy()
             
-    # ★★★ ここからが新しい勾配ベースの解析ロジック ★★★
     def _analyze_by_gradient(self, gradient_threshold_factor: float):
         """勾配（変化率）と閾値に基づいてセグメントを検出する"""
         if self.y_data is None:
             raise ValueError("データが処理されていません。")
 
-        # 1. 勾配を計算 (平滑化済みのデータに対して行う)
         gradient = np.abs(np.gradient(self.y_data))
-
-        # 2. 勾配に基づいて閾値を決定
-        #    閾値 = 中央値 + 標準偏差 * 係数
         threshold = np.median(gradient) + gradient_threshold_factor * np.std(gradient)
-
-        # 3. 閾値を超えた点を 'Transition'、それ以外を 'Stair' とする
         labels = np.where(gradient > threshold, 'Transition', 'Stair')
-
-        # 4. ラベルの変化点からセグメントの境界を決定
         boundaries = [0] + list(np.where(np.diff(labels) != 0)[0] + 1) + [len(self.y_data)]
-        boundaries = sorted(list(set(boundaries))) # 重複を削除
+        boundaries = sorted(list(set(boundaries)))
 
-        # 5. セグメントリストを作成
         segments = []
         for i in range(len(boundaries) - 1):
             start, end = boundaries[i], boundaries[i+1]
             if start >= end: continue
-            # セグメントのタイプは、その領域の最初の点のラベルで決定
             seg_type = labels[start]
             segments.append({'id': i, 'start': start, 'end': end, 'type': seg_type})
         
         self.segments = segments
         self._finalize_segments()
 
-    # --- 従来のペナルティベースの解析ロジック（名前を変更して維持）---
     def _analyze_by_penalty(self, params: dict):
         """従来のPenalty法でセグメントを検出する"""
         signal = np.log1p(self.y_data.clip(lower=Config.LOG_CLIP_VALUE)) if params['use_log'] else self.y_data.copy()
@@ -128,10 +115,8 @@ class AnalysisModel:
         self.segments = segments
         self._finalize_segments()
     
-    # --- どの解析手法からでも呼ばれる共通の仕上げ処理 ---
     def _finalize_segments(self):
-        """セグメントの結合、ID割り当て、平均値計算などを行う"""
-        # 同じタイプの隣接セグメントを結合
+        """セグメントの結合、ID割り当て、平均値計算などを行う共通処理"""
         i = 0
         while i < len(self.segments) - 1:
             s1, s2 = self.segments[i], self.segments[i+1]
@@ -141,7 +126,6 @@ class AnalysisModel:
                 continue
             i += 1
         
-        # 最終的なセグメント情報を計算
         for idx, seg in enumerate(self.segments):
             seg['id'] = idx
             seg['avg'] = self.y_data.iloc[seg['start']:seg['end']].mean()
@@ -149,7 +133,6 @@ class AnalysisModel:
         self._assign_nd_numbers(self.segments)
         self.boundaries = [s['start'] for s in self.segments] + ([self.segments[-1]['end']] if self.segments else [])
 
-    # --- 以下は主に従来法で使われるヘルパーメソッド ---
     def _analyze_with_variable_penalty(self, signal, model, chunk_size, start_penalty, end_penalty):
         n_samples = len(signal)
         log_start_penalty = np.log(max(start_penalty, 1e-9))
@@ -192,22 +175,18 @@ class AnalysisModel:
 class AnalysisView:
     def __init__(self, root: tk.Tk, controller):
         self.root = root; self.controller = controller
-        self.root.title("Step Data Analyzer v13.0")
+        self.root.title("Step Data Analyzer v13.2")
 
-        # --- Variables ---
         self.filepath_var = tk.StringVar()
         self.start_filter_var = tk.StringVar(value="1")
         self.filter_step_var = tk.StringVar(value="1")
-        self.use_smoothing_var = tk.BooleanVar(value=True) # デフォルトで平滑化をONに
+        self.use_smoothing_var = tk.BooleanVar(value=True)
         self.smoothing_window_var = tk.StringVar(value="5")
         
-        # ★解析手法選択用の変数
         self.analysis_method_var = tk.StringVar(value="Gradient (Threshold)")
         
-        # --- Gradient Method Params ---
         self.gradient_factor_var = tk.StringVar(value=str(Config.GRADIENT_THRESHOLD_FACTOR))
         
-        # --- Penalty Method Params ---
         self.use_log_transform_var = tk.BooleanVar(value=True)
         self.use_classification_var = tk.BooleanVar(value=True)
         self.detection_model_var = tk.StringVar(value="l2")
@@ -216,10 +195,8 @@ class AnalysisView:
         self.chunk_size_var = tk.StringVar(value="500")
 
         self._create_main_layout()
-        self.controller.toggle_analysis_widgets() # 初期状態でUIを更新
     
     def _create_main_layout(self):
-        # ... (変更なし) ...
         paned_window = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         paned_window.pack(fill="both", expand=True, padx=10, pady=10)
         control_frame = ttk.Frame(paned_window, width=400)
@@ -230,7 +207,6 @@ class AnalysisView:
         paned_window.add(graph_frame, weight=3)
     
     def _create_control_panel(self, parent: ttk.Frame):
-        # ... (変更なし) ...
         parent.grid_rowconfigure(1, weight=1); parent.grid_columnconfigure(0, weight=1)
         params_frame = ttk.LabelFrame(parent, text="Parameters", padding="10")
         params_frame.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
@@ -242,12 +218,10 @@ class AnalysisView:
     def _create_parameter_inputs(self, parent: ttk.Frame):
         parent.columnconfigure(1, weight=1)
         
-        # --- File Selection ---
         ttk.Label(parent, text="Data File:").grid(row=0, column=0, columnspan=3, sticky="w", pady=2)
         ttk.Entry(parent, textvariable=self.filepath_var, state="readonly").grid(row=1, column=0, columnspan=2, sticky="ew")
         ttk.Button(parent, text="Browse...", command=self.controller.browse_file).grid(row=1, column=2, padx=(5,0))
 
-        # --- General Settings ---
         gen_frame = ttk.LabelFrame(parent, text="General Settings", padding=5)
         gen_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10,0))
         ttk.Checkbutton(gen_frame, text="Apply Smoothing", variable=self.use_smoothing_var).grid(row=0, column=0, sticky="w")
@@ -255,23 +229,28 @@ class AnalysisView:
         self.smoothing_window_entry = ttk.Entry(gen_frame, textvariable=self.smoothing_window_var, width=8)
         self.smoothing_window_entry.grid(row=0, column=2, sticky="w", padx=2)
 
-        # ★★★ 解析手法の選択UI ★★★
+        # ★★★ 復活させたフィルタ番号設定UI ★★★
+        filter_frame = ttk.LabelFrame(parent, text="Filter Numbering (for Stairs)", padding=5)
+        filter_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10,0))
+        ttk.Label(filter_frame, text="Start Number:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(filter_frame, textvariable=self.start_filter_var, width=10).grid(row=0, column=1, sticky="w")
+        ttk.Label(filter_frame, text="Step:").grid(row=1, column=0, sticky="w", pady=(0,2))
+        ttk.Entry(filter_frame, textvariable=self.filter_step_var, width=10).grid(row=1, column=1, sticky="w")
+        
         method_frame = ttk.LabelFrame(parent, text="Analysis Method", padding=5)
-        method_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10,0))
+        method_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(10,0))
         method_menu = ttk.OptionMenu(method_frame, self.analysis_method_var, self.analysis_method_var.get(), 
                                      "Gradient (Threshold)", "Penalty (Ruptures)",
                                      command=lambda e: self.controller.toggle_analysis_widgets())
         method_menu.pack(fill='x')
 
-        # --- Gradient Method Frame ---
         self.grad_frame = ttk.LabelFrame(parent, text="Gradient Method Settings", padding=5)
-        self.grad_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(5,0))
+        self.grad_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(5,0))
         ttk.Label(self.grad_frame, text="Threshold Factor (↓ sensitive):").grid(row=0, column=0, sticky="w")
         ttk.Entry(self.grad_frame, textvariable=self.gradient_factor_var, width=10).grid(row=0, column=1, sticky="w", padx=5)
         
-        # --- Penalty Method Frame ---
         self.pen_frame = ttk.LabelFrame(parent, text="Penalty Method Settings", padding=5)
-        self.pen_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(5,0))
+        self.pen_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(5,0))
         self.pen_frame.columnconfigure(1, weight=1)
         ttk.Checkbutton(self.pen_frame, text="Use Log Transform", variable=self.use_log_transform_var).grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(self.pen_frame, text="Model:").grid(row=1, column=0, sticky="w")
@@ -283,8 +262,7 @@ class AnalysisView:
         ttk.Label(self.pen_frame, text="Chunk Size:").grid(row=4, column=0, sticky="w")
         ttk.Entry(self.pen_frame, textvariable=self.chunk_size_var, width=10).grid(row=4, column=1, sticky="w")
 
-        # --- Run Button ---
-        ttk.Button(parent, text="Run Analysis", command=self.controller.run_analysis, style="Accent.TButton").grid(row=6, column=0, columnspan=3, pady=(15,5), sticky="ew")
+        ttk.Button(parent, text="Run Analysis", command=self.controller.run_analysis, style="Accent.TButton").grid(row=7, column=0, columnspan=3, pady=(15,5), sticky="ew")
 
     def get_ui_parameters(self) -> dict:
         try:
@@ -296,7 +274,7 @@ class AnalysisView:
             }
             if params['analysis_method'] == "Gradient (Threshold)":
                 params["gradient_threshold_factor"] = float(self.gradient_factor_var.get())
-            else: # Penalty Method
+            else:
                 params.update({
                     "use_log": self.use_log_transform_var.get(),
                     "use_classification": self.use_classification_var.get(), 
@@ -305,7 +283,6 @@ class AnalysisView:
                     "end_penalty": float(self.end_penalty_var.get()),
                     "chunk_size": int(self.chunk_size_var.get())
                 })
-            # Filter params are always needed
             params.update({
                 "start_filter": int(self.start_filter_var.get()),
                 "filter_step": int(self.filter_step_var.get())
@@ -315,7 +292,6 @@ class AnalysisView:
             self.show_error("Invalid Parameter", f"パラメータを確認してください。\n詳細: {e}")
             return None
     
-    # ... (redraw_plot, update_segment_buttons などの他のViewメソッドは変更なし) ...
     def _create_segment_list(self, parent: ttk.Frame):
         parent.grid_rowconfigure(0, weight=1); parent.grid_columnconfigure(0, weight=1)
         canvas = tk.Canvas(parent, highlightthickness=0)
@@ -352,7 +328,7 @@ class AnalysisView:
             elif seg['type'] == 'Transition':
                 self.ax.axvspan(seg['start'], seg['end'], color=Config.TRANSITION_AREA_COLOR, alpha=0.3, zorder=0)
         for b in model.boundaries[1:-1]:
-            self.ax.axvline(x=b, color=Config.SEPARATOR_line_color, linestyle='--', linewidth=1, zorder=3)
+            self.ax.axvline(x=b, color=Config.SEPARATOR_LINE_COLOR, linestyle='--', linewidth=1, zorder=3)
         self.ax.set_title('Step Data Analysis Results'); self.ax.set_xlabel('Data Point Index'); self.ax.set_ylabel('Intensity (μJ)')
         self.ax.legend(loc='upper right'); self.ax.grid(True, linestyle=':', alpha=0.6)
         if model.y_data is not None and not model.y_data.empty:
@@ -372,7 +348,6 @@ class AnalysisView:
     def show_error(self, title: str, message: str): messagebox.showerror(title, message)
     def show_info(self, title: str, message: str): messagebox.showinfo(title, message)
 
-
 # ==============================================================================
 # CONTROLLER: ViewとModelを仲介
 # ==============================================================================
@@ -380,10 +355,13 @@ class AnalysisController:
     def __init__(self, root: tk.Tk):
         self.model = AnalysisModel()
         self.view = AnalysisView(root, self)
+        self.toggle_analysis_widgets() 
         self.view.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         s = ttk.Style(); s.configure('Accent.TButton', font=('calibri', 10, 'bold'), foreground='white', background='#0078D7')
 
-    def on_closing(self): plt.close('all'); self.view.root.destroy()
+    def on_closing(self):
+        plt.close('all')
+        self.view.root.destroy()
 
     def run_analysis(self):
         params = self.view.get_ui_parameters()
@@ -394,10 +372,9 @@ class AnalysisController:
             self.model.load_data(params['filepath'])
             self.model.process_data(params['use_smoothing'], params['smoothing_window'])
             
-            # ★選択された手法に応じてモデルのメソッドを呼び出す
             if params['analysis_method'] == "Gradient (Threshold)":
                 self.model._analyze_by_gradient(params['gradient_threshold_factor'])
-            else: # "Penalty (Ruptures)"
+            else:
                 self.model._analyze_by_penalty(params)
 
             self.view.redraw_plot(self.model)
