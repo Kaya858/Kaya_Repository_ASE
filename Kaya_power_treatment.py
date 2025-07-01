@@ -53,49 +53,49 @@ class AnalysisModel:
             self.y_data = self.y_data_raw.copy()
 
     # ★変更点1: ペナルティ関数を指数関数的に変更
-    def _analyze_with_variable_penalty(self, signal, model, chunk_size, start_penalty, end_penalty):
-    """
-    ★適応型ペナルティを導入★
-    ペナルティを「位置」と「局所的な信号レベル」の両方に連動させる。
-    """
-    n_samples = len(signal)
-    
-    log_start_penalty = np.log(max(start_penalty, 1e-9))
-    log_end_penalty = np.log(max(end_penalty, 1e-9))
-    
-    # UIのペナルティ値は「基本乗数」として機能する
-    multiplier_func = lambda x: np.exp(log_start_penalty + (log_end_penalty - log_start_penalty) * (x / n_samples))
-
-    all_bkps = set()
-    
-    for start in range(0, n_samples, chunk_size):
-        end = min(start + chunk_size + (chunk_size // 4), n_samples)
-        chunk_signal = signal[start:end]
+    def _analyze_with_variable_penalty(self, signal, model, chunk_size, start_penalty, end_penalty): # noqa: E501
+        """
+        ★適応型ペナルティを導入★
+        ペナルティを「位置」と「局所的な信号レベル」の両方に連動させる。
+        """
+        n_samples = len(signal)
         
-        mid_point = start + len(chunk_signal) // 2
+        log_start_penalty = np.log(max(start_penalty, 1e-9))
+        log_end_penalty = np.log(max(end_penalty, 1e-9))
         
-        # --- ▼ここから変更▼ ---
-        # 1. 位置に応じた基本乗数を計算
-        base_multiplier = multiplier_func(mid_point)
+        # UIのペナルティ値は「基本乗数」として機能する
+        multiplier_func = lambda x: np.exp(log_start_penalty + (log_end_penalty - log_start_penalty) * (x / n_samples)) # noqa: E731
+
+        all_bkps = set()
         
-        # 2. チャンク内の信号の平均値を「スケール係数」とする
-        #    信号が小さい場所では係数が小さく、大きい場所では係数が大きくなる
-        #    log変換後の信号の平均値を使用。+1することで0近辺での効果を安定させる
-        local_scale_factor = chunk_signal.mean() + 1.0
-
-        # 3. 最終的なペナルティは、基本乗数とスケール係数の積とする
-        current_penalty = base_multiplier * local_scale_factor
-        # --- ▲ここまで変更▲ ---
-
-        algo = rpt.Pelt(model=model, min_size=Config.MIN_SEGMENT_LEN).fit(chunk_signal.values)
-        try:
-            bkps_in_chunk = algo.predict(pen=current_penalty)
-            adjusted_bkps = [b + start for b in bkps_in_chunk if b < len(chunk_signal)]
-            all_bkps.update(adjusted_bkps)
-        except Exception:
-            continue
+        for start in range(0, n_samples, chunk_size):
+            end = min(start + chunk_size + (chunk_size // 4), n_samples)
+            chunk_signal = signal[start:end]
             
-    return sorted(list(all_bkps))
+            mid_point = start + len(chunk_signal) // 2
+            
+            # --- ▼ここから変更▼ ---
+            # 1. 位置に応じた基本乗数を計算
+            base_multiplier = multiplier_func(mid_point)
+            
+            # 2. チャンク内の信号の平均値を「スケール係数」とする
+            #    信号が小さい場所では係数が小さく、大きい場所では係数が大きくなる
+            #    log変換後の信号の平均値を使用。+1することで0近辺での効果を安定させる
+            local_scale_factor = chunk_signal.mean() + 1.0
+
+            # 3. 最終的なペナルティは、基本乗数とスケール係数の積とする
+            current_penalty = base_multiplier * local_scale_factor
+            # --- ▲ここまで変更▲ ---
+
+            algo = rpt.Pelt(model=model, min_size=Config.MIN_SEGMENT_LEN).fit(chunk_signal.values)
+            try:
+                bkps_in_chunk = algo.predict(pen=current_penalty)
+                adjusted_bkps = [b + start for b in bkps_in_chunk if b < len(chunk_signal)]
+                all_bkps.update(adjusted_bkps)
+            except Exception:
+                continue
+                
+        return sorted(list(all_bkps))
 
     # ★変更点2: K-Meansによるセグメント分類ロジックに置き換え
     def analyze_segments(self, use_log, model, use_classification, gradient_threshold_factor,
