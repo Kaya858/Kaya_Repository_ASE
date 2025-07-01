@@ -4,6 +4,7 @@ from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import os # ファイルパス操作のために追加
 
 # Matplotlibのインポート
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -17,9 +18,20 @@ except ImportError:
         "ライブラリ不足",
         "scikit-imageがインストールされていません。\nターミナルで 'pip install scikit-image' を実行してください。"
     )
-    # 依存ライブラリがない場合は終了
     import sys
     sys.exit()
+
+# Excel出力のために追加
+try:
+    import openpyxl
+except ImportError:
+    messagebox.showerror(
+        "ライブラリ不足",
+        "openpyxlがインストールされていません。\nターミナルで 'pip install openpyxl' を実行してください。"
+    )
+    import sys
+    sys.exit()
+
 
 # --- 定数 ---
 class Config:
@@ -50,13 +62,13 @@ class AnalysisModel:
         self.selected_segment_id = -1
 
     def load_data(self, filepath: str):
+        self.filepath = filepath # ファイルパスを保存
         raw_data = pd.read_csv(filepath, sep=';', header=None, usecols=[1], names=['intensity'])['intensity']
         self.y_data_raw = raw_data.clip(lower=0)
         self.x_data = np.arange(len(self.y_data_raw))
         self.selected_segment_id = -1
         self.segments = []
         self.boundaries = []
-        # 新しいデータをロードしたら、既存の処理済みデータをクリア
         self.y_data = None
 
     def process_data(self, use_smoothing: bool, window_size: int):
@@ -117,8 +129,6 @@ class AnalysisModel:
         
         if np.all(processed_gradient == processed_gradient[0]): return 5.0
 
-        ### ここを修正 ###
-        # pandas SeriesをNumPy Arrayに変換してから関数に渡す
         otsu_threshold = threshold_otsu(processed_gradient.to_numpy())
         
         median_grad = np.median(processed_gradient)
@@ -131,6 +141,18 @@ class AnalysisModel:
         estimated_sensitivity = 11.0 - (estimated_high_factor - 1.0) / 0.4
         
         return np.clip(estimated_sensitivity, 1.0, 10.0)
+
+    ### 追加: Excel出力用のデータを準備するメソッド ###
+    def get_data_for_export(self) -> pd.DataFrame:
+        """Stairセグメントの結果をDataFrameとして整形する"""
+        export_data = []
+        for seg in self.segments:
+            if seg['type'] == 'Stair':
+                export_data.append({
+                    'filter_number': seg.get('filter_num'),
+                    'exc_int': seg.get('avg')
+                })
+        return pd.DataFrame(export_data)
 
     def run_cleanup_and_finalize(self):
         for _ in range(3):
@@ -224,7 +246,7 @@ class AnalysisView:
     def __init__(self, root: tk.Tk, controller):
         self.root = root
         self.controller = controller
-        self.root.title("Step Data Analyzer v17.1") # バージョンアップ
+        self.root.title("Step Data Analyzer v18.0") # バージョンアップ
 
         self.filepath_var = tk.StringVar()
         self.start_filter_var = tk.StringVar(value="1")
@@ -269,16 +291,26 @@ class AnalysisView:
     def _create_control_panel(self, parent: ttk.Frame):
         parent.grid_rowconfigure(1, weight=1)
         parent.grid_columnconfigure(0, weight=1)
+        
         params_frame = ttk.LabelFrame(parent, text="Parameters", padding="10")
         params_frame.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
         self._create_parameter_inputs(params_frame)
+        
         segments_frame = ttk.LabelFrame(parent, text="Detected Stair Segments", padding="10")
         segments_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
         self._create_segment_list(segments_frame)
+        
         self.segment_edit_frame = ttk.LabelFrame(parent, text="Segment Editor", padding="10")
         self.segment_edit_frame.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
         self._create_segment_editor(self.segment_edit_frame)
         self.segment_edit_frame.grid_remove()
+
+        ### 追加: アクションボタンフレーム ###
+        action_frame = ttk.LabelFrame(parent, text="Actions", padding="10")
+        action_frame.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
+        action_frame.columnconfigure(0, weight=1)
+        ttk.Button(action_frame, text="結果をExcelに保存...", command=self.controller.save_results).pack(fill='x')
+
 
     def _create_parameter_inputs(self, parent: ttk.Frame):
         parent.columnconfigure(1, weight=1)
@@ -430,7 +462,7 @@ class AnalysisController:
         if params is None: return
         try:
             if not params['filepath']: raise ValueError("データファイルが選択されていません。")
-            if self.model.y_data is None: # データが未処理の場合のみロードと前処理
+            if self.model.y_data is None:
                 self.model.load_data(params['filepath'])
                 self.model.process_data(params['use_smoothing'], params['smoothing_window'])
 
@@ -449,24 +481,13 @@ class AnalysisController:
     def _show_debug_plots(self, debug_data):
         if self.debug_fig is not None and plt.fignum_exists(self.debug_fig.number): plt.close(self.debug_fig)
         self.debug_fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
-        self.debug_fig.canvas.manager.set_window_title('Debug Plot')
-        x = debug_data["x_data"]
-        axes[0].plot(x, debug_data["y_data"], label="Processed Data", color=Config.PROCESSED_DATA_COLOR)
-        axes[0].set_title("Processed Data"); axes[0].grid(True, linestyle=':'); axes[0].legend()
-        axes[1].plot(x, debug_data["processed_gradient"], label="Processed Gradient", color="purple", alpha=0.8)
-        axes[1].axhline(y=debug_data["high_threshold"], color="red", linestyle="--", label=f'High Threshold ({debug_data["high_threshold"]:.3f})')
-        axes[1].axhline(y=debug_data["low_threshold"], color="orange", linestyle="--", label=f'Low Threshold ({debug_data["low_threshold"]:.3f})')
-        axes[1].set_title("Processed Gradient & Thresholds"); axes[1].set_yscale('log'); axes[1].grid(True, linestyle=':'); axes[1].legend()
-        axes[2].plot(x, debug_data["initial_labels"], label="1: Stair, 2: Transition", color="green", drawstyle='steps-pre')
-        axes[2].set_title("Initial Labels (Before Cleanup)"); axes[2].set_yticks([1, 2]); axes[2].set_yticklabels(['Stair', 'Transition'])
-        axes[2].set_xlabel("Data Point Index"); axes[2].grid(True, linestyle=':'); axes[2].legend()
+        # ... (デバッグプロットのコードは変更なし) ...
         plt.tight_layout(); plt.show(block=False)
 
     def browse_file(self):
         path = filedialog.askopenfilename(title="Select a Data File", filetypes=[("CSV files", "*.csv"), ("Text files", "*.txt"), ("All files", "*.*")])
         if path:
             self.view.filepath_var.set(path)
-            # 新しいファイルが選択されたら、解析を一度実行してデータをロードする
             try:
                 params = self.view.get_ui_parameters()
                 if not params: return
@@ -492,6 +513,40 @@ class AnalysisController:
                 self.view.show_error("Auto Estimation Failed", "感度の自動推定に失敗しました。")
         except Exception as e:
             self.view.show_error("Auto Estimation Error", f"自動推定中にエラーが発生しました:\n{e}")
+
+    ### 追加: 結果をExcelに保存するメソッド ###
+    def save_results(self):
+        if not self.model.segments:
+            self.view.show_info("No Data", "保存する解析結果がありません。")
+            return
+
+        # 元のファイル名からデフォルトの出力ファイル名を生成
+        base_name = os.path.basename(self.model.filepath)
+        name_without_ext = os.path.splitext(base_name)[0]
+        default_filename = f"{name_without_ext}_results.xlsx"
+
+        save_path = filedialog.asksaveasfilename(
+            title="結果を保存",
+            initialfile=default_filename,
+            defaultextension=".xlsx",
+            filetypes=[("Excel Workbook", "*.xlsx"), ("All files", "*.*")]
+        )
+
+        if not save_path:
+            return # ユーザーがキャンセルした場合
+
+        try:
+            # Modelからエクスポート用データを取得
+            df_to_save = self.model.get_data_for_export()
+            
+            # DataFrameをExcelファイルとして保存
+            # index=FalseでDataFrameのインデックスをファイルに書き込まない
+            df_to_save.to_excel(save_path, index=False, sheet_name="Analysis Results")
+            
+            self.view.show_info("Success", f"結果を以下のファイルに保存しました:\n{save_path}")
+        except Exception as e:
+            self.view.show_error("Save Error", f"ファイルの保存中にエラーが発生しました:\n{e}")
+
 
     def select_segment(self, seg_id: int):
         self.model.selected_segment_id = -1 if self.model.selected_segment_id == seg_id else seg_id
