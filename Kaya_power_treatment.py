@@ -4,6 +4,7 @@ from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.signal import medfilt
 
 # Matplotlibのインポート文を修正
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -46,7 +47,9 @@ class AnalysisModel:
 
     def process_data(self, use_smoothing: bool, window_size: int):
         if use_smoothing and window_size >= 2:
-            smoothed = self.y_data_raw.rolling(window=window_size, center=True).mean()
+            # ウィンドウサイズは奇数である必要があるため調整
+            win_size = window_size if window_size % 2 != 0 else window_size + 1
+            smoothed = pd.Series(medfilt(self.y_data_raw, kernel_size=win_size))
             self.y_data = smoothed.fillna(method='bfill').fillna(method='ffill')
         else:
             self.y_data = self.y_data_raw.copy()
@@ -59,13 +62,10 @@ class AnalysisModel:
         gradient = np.abs(np.gradient(y_log))
         log_local_mean = y_log.rolling(window=21, center=True, min_periods=1).mean()
 
-        # ### 変更点：正規化の抑制（Damping）###
-        # 分母が小さくなりすぎるのを防ぐため、抑制項を加える
-        # これにより、信号が小さい領域でのノイズ増幅を防ぐ
-        damping_factor = np.median(log_local_mean) * 0.5
+        # 適応的な正規化の抑制
+        damping_factor = np.abs(log_local_mean) * 0.05 + 1e-6 # 0.05は調整可能なパラメータ
         processed_gradient = gradient / (log_local_mean + damping_factor)
 
-        # 以降は、この抑制処理された勾配を使って閾値判定を行う
         median_grad = np.median(processed_gradient)
         mad = np.median(np.abs(processed_gradient - median_grad))
         robust_std = mad * 1.4826
@@ -99,6 +99,43 @@ class AnalysisModel:
 
         self.segments = segments
         self._finalize_segments()
+        
+        # 新しいセグメント統合ロジックを呼び出す
+        self._merge_short_stairs()
+        
+        # 統合後に再度セグメントを整理
+        self._finalize_segments()
+
+    def _merge_short_stairs(self):
+        """
+        短いStairセグメントを、隣接するTransitionを挟んで統合する後処理。
+        [短いStair] - [Transition] - [短いStair] のパターンを探索し、
+        1つの大きなStairセグメントにまとめる。
+        """
+        if len(self.segments) < 3:
+            return
+
+        stair_lengths = [s['end'] - s['start'] for s in self.segments if s['type'] == 'Stair']
+        if not stair_lengths:
+            return
+            
+        length_threshold = np.median(stair_lengths) / 4.0
+
+        i = 0
+        while i < len(self.segments) - 2:
+            s1, s2, s3 = self.segments[i], self.segments[i+1], self.segments[i+2]
+
+            if s1['type'] == 'Stair' and s2['type'] == 'Transition' and s3['type'] == 'Stair':
+                len1 = s1['end'] - s1['start']
+                len3 = s3['end'] - s3['start']
+
+                if len1 < length_threshold and len3 < length_threshold:
+                    s1['end'] = s3['end']
+                    self.segments.pop(i + 1)
+                    self.segments.pop(i + 1)
+                    continue
+            
+            i += 1
 
     def _finalize_segments(self):
         i = 0
@@ -139,7 +176,7 @@ class AnalysisView:
     def __init__(self, root: tk.Tk, controller):
         self.root = root
         self.controller = controller
-        self.root.title("Step Data Analyzer v14.2")
+        self.root.title("Step Data Analyzer v15.0") # バージョンアップ
 
         self.filepath_var = tk.StringVar()
         self.start_filter_var = tk.StringVar(value="1")
@@ -185,7 +222,7 @@ class AnalysisView:
 
         gen_frame = ttk.LabelFrame(parent, text="General Settings", padding=5)
         gen_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10,0))
-        ttk.Checkbutton(gen_frame, text="Apply Smoothing", variable=self.use_smoothing_var).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(gen_frame, text="Apply Smoothing (Median Filter)", variable=self.use_smoothing_var).grid(row=0, column=0, sticky="w")
         ttk.Label(gen_frame, text="Window:").grid(row=0, column=1, sticky="e")
         self.smoothing_window_entry = ttk.Entry(gen_frame, textvariable=self.smoothing_window_var, width=8)
         self.smoothing_window_entry.grid(row=0, column=2, sticky="w", padx=2)
