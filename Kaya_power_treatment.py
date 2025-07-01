@@ -24,7 +24,7 @@ class Config:
     FILTER_CYCLE = 36
 
 # ==============================================================================
-# MODEL: データとビジネスロジックを管理 (変更なし)
+# MODEL: データとビジネスロジックを管理
 # ==============================================================================
 class AnalysisModel:
     def __init__(self):
@@ -52,8 +52,16 @@ class AnalysisModel:
         else:
             self.y_data = self.y_data_raw.copy()
 
-    def analyze_by_gradient(self, high_factor: float, low_factor: float) -> tuple[list, dict]:
+    ### 変更点 ###
+    # analyze_by_gradient の引数を sensitivity に変更
+    def analyze_by_gradient(self, sensitivity: float) -> tuple[list, dict]:
         if self.y_data is None: raise ValueError("データが処理されていません。")
+
+        # sensitivity (1.0-10.0) から high/low factorを計算
+        # 値が大きいほど敏感（factorが小さく）になるように設定
+        high_factor = 1.0 + (11.0 - sensitivity) * 0.4
+        low_factor = high_factor / 3.0
+
         y_log = np.log1p(self.y_data)
         gradient = np.abs(np.gradient(y_log))
         log_local_mean = y_log.rolling(window=21, center=True, min_periods=1).mean()
@@ -62,15 +70,20 @@ class AnalysisModel:
         median_grad = np.median(processed_gradient)
         mad = np.median(np.abs(processed_gradient - median_grad))
         robust_std = mad * 1.4826 + 1e-9
+
+        # 計算したfactorで閾値を設定
         high_threshold = median_grad + high_factor * robust_std
         low_threshold = median_grad + low_factor * robust_std
+
         if low_threshold >= high_threshold: raise ValueError("低い閾値は高い閾値より小さく設定してください。")
+
         initial_labels = np.full(y_log.shape, 1, dtype=int)
         in_transition = False
         for i, grad_val in enumerate(processed_gradient):
             if not in_transition and grad_val > high_threshold: in_transition = True
             elif in_transition and grad_val < low_threshold: in_transition = False
             if in_transition: initial_labels[i] = 2
+
         change_points = np.where(initial_labels[:-1] != initial_labels[1:])[0] + 1
         boundaries = sorted(list(set([0] + list(change_points) + [len(y_log)])))
         initial_segments = []
@@ -79,6 +92,7 @@ class AnalysisModel:
             if start >= end: continue
             seg_type = 'Stair' if initial_labels[start] == 1 else 'Transition'
             initial_segments.append({'id': i, 'start': start, 'end': end, 'type': seg_type})
+        
         debug_data = {"processed_gradient": processed_gradient, "high_threshold": high_threshold, "low_threshold": low_threshold, "initial_labels": initial_labels, "y_data": self.y_data, "x_data": self.x_data}
         return initial_segments, debug_data
 
@@ -116,6 +130,7 @@ class AnalysisModel:
                 if change <= 0: should_merge = True
                 elif last_max_transition_size is not None:
                     if abs(change) < (last_max_transition_size / 4.0): should_merge = True
+                
                 if should_merge:
                     prev_s['end'] = next_s['end']
                     merged_data = self.y_data.iloc[prev_s['start']:prev_s['end']]
@@ -173,7 +188,7 @@ class AnalysisView:
     def __init__(self, root: tk.Tk, controller):
         self.root = root
         self.controller = controller
-        self.root.title("Step Data Analyzer v15.1")
+        self.root.title("Step Data Analyzer v16.0") ### 変更点: バージョンアップ
 
         self.filepath_var = tk.StringVar()
         self.start_filter_var = tk.StringVar(value="1")
@@ -181,11 +196,9 @@ class AnalysisView:
         self.use_smoothing_var = tk.BooleanVar(value=True)
         self.smoothing_window_var = tk.StringVar(value="15")
         
-        # ### 変更点：数値フォーマット用のStringVarを追加 ###
-        self.gradient_high_factor_var = tk.DoubleVar(value=3.0)
-        self.gradient_low_factor_var = tk.DoubleVar(value=1.0)
-        self.high_factor_str = tk.StringVar(value=f"{self.gradient_high_factor_var.get():.2f}")
-        self.low_factor_str = tk.StringVar(value=f"{self.gradient_low_factor_var.get():.2f}")
+        ### 変更点: 閾値関連の変数を「感度」に一本化 ###
+        self.sensitivity_var = tk.DoubleVar(value=5.0) # デフォルト値は5 (1-10の範囲)
+        self.sensitivity_str = tk.StringVar(value=f"{self.sensitivity_var.get():.1f}")
         
         self.edit_start_var = tk.IntVar()
         self.edit_end_var = tk.IntVar()
@@ -193,33 +206,23 @@ class AnalysisView:
         self._create_main_layout()
         self._link_vars()
 
-    # ### 変更点：変数間の同期を設定するメソッド ###
+    ### 変更点: 変数同期のロジックを感度用に変更 ###
     def _link_vars(self):
-        """変数間の同期（スライダーと入力ボックス）を設定する"""
-        def on_high_slider_change(val):
-            self.high_factor_str.set(f"{float(val):.2f}")
+        """感度スライダーと入力ボックスの値を同期させる"""
+        def on_slider_change(val):
+            self.sensitivity_str.set(f"{float(val):.1f}")
 
-        def on_low_slider_change(val):
-            self.low_factor_str.set(f"{float(val):.2f}")
-        
-        def on_high_entry_change(*args):
+        def on_entry_change(*args):
             try:
-                val = float(self.high_factor_str.get())
-                self.gradient_high_factor_var.set(val)
+                val = float(self.sensitivity_str.get())
+                # スライダーの範囲内に値を収める
+                if 1.0 <= val <= 10.0:
+                    self.sensitivity_var.set(val)
             except (ValueError, TypeError):
                 pass # 不正な値は無視
 
-        def on_low_entry_change(*args):
-            try:
-                val = float(self.low_factor_str.get())
-                self.gradient_low_factor_var.set(val)
-            except (ValueError, TypeError):
-                pass
-
-        self.gradient_high_factor_var.trace_add("write", lambda *args: on_high_slider_change(self.gradient_high_factor_var.get()))
-        self.gradient_low_factor_var.trace_add("write", lambda *args: on_low_slider_change(self.gradient_low_factor_var.get()))
-        self.high_factor_str.trace_add("write", on_high_entry_change)
-        self.low_factor_str.trace_add("write", on_low_entry_change)
+        self.sensitivity_var.trace_add("write", lambda *args: on_slider_change(self.sensitivity_var.get()))
+        self.sensitivity_str.trace_add("write", on_entry_change)
 
     def _create_main_layout(self):
         paned_window = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
@@ -247,16 +250,18 @@ class AnalysisView:
 
     def _create_parameter_inputs(self, parent: ttk.Frame):
         parent.columnconfigure(1, weight=1)
-        # ... (File, General, Filter Numberingは変更なし) ...
+        
         ttk.Label(parent, text="Data File:").grid(row=0, column=0, columnspan=3, sticky="w", pady=2)
         ttk.Entry(parent, textvariable=self.filepath_var, state="readonly").grid(row=1, column=0, columnspan=2, sticky="ew")
         ttk.Button(parent, text="Browse...", command=self.controller.browse_file).grid(row=1, column=2, padx=(5,0))
+        
         gen_frame = ttk.LabelFrame(parent, text="General Settings", padding=5)
         gen_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10,0))
         ttk.Checkbutton(gen_frame, text="Apply Smoothing", variable=self.use_smoothing_var).grid(row=0, column=0, sticky="w")
         ttk.Label(gen_frame, text="Window:").grid(row=0, column=1, sticky="e")
         self.smoothing_window_entry = ttk.Entry(gen_frame, textvariable=self.smoothing_window_var, width=8)
         self.smoothing_window_entry.grid(row=0, column=2, sticky="w", padx=2)
+        
         filter_frame = ttk.LabelFrame(parent, text="Filter Numbering (for Stairs)", padding=5)
         filter_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10,0))
         ttk.Label(filter_frame, text="Start Number:").grid(row=0, column=0, sticky="w")
@@ -264,18 +269,14 @@ class AnalysisView:
         ttk.Label(filter_frame, text="Step:").grid(row=1, column=0, sticky="w", pady=(0,2))
         ttk.Entry(filter_frame, textvariable=self.filter_step_var, width=10).grid(row=1, column=1, sticky="w")
         
-        # ### 変更点：閾値設定UIを更新 ###
-        grad_frame = ttk.LabelFrame(parent, text="Gradient Method Settings", padding=5)
-        grad_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(10,0))
-        grad_frame.columnconfigure(1, weight=1)
+        ### 変更点: 閾値設定UIを「感度」スライダーに変更 ###
+        detection_frame = ttk.LabelFrame(parent, text="Detection Settings", padding=5)
+        detection_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(10,0))
+        detection_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(grad_frame, text="High Threshold Factor (↓ sensitive):").grid(row=0, column=0, sticky="w")
-        ttk.Scale(grad_frame, from_=0.1, to=10.0, orient=tk.HORIZONTAL, variable=self.gradient_high_factor_var).grid(row=0, column=1, sticky="ew", padx=5)
-        ttk.Entry(grad_frame, textvariable=self.high_factor_str, width=5).grid(row=0, column=2)
-
-        ttk.Label(grad_frame, text="Low Threshold Factor (↑ sensitive):").grid(row=1, column=0, sticky="w")
-        ttk.Scale(grad_frame, from_=0.1, to=10.0, orient=tk.HORIZONTAL, variable=self.gradient_low_factor_var).grid(row=1, column=1, sticky="ew", padx=5)
-        ttk.Entry(grad_frame, textvariable=self.low_factor_str, width=5).grid(row=1, column=2)
+        ttk.Label(detection_frame, text="Sensitivity (鈍感 <-> 敏感):").grid(row=0, column=0, sticky="w")
+        ttk.Scale(detection_frame, from_=1.0, to=10.0, orient=tk.HORIZONTAL, variable=self.sensitivity_var).grid(row=0, column=1, sticky="ew", padx=5)
+        ttk.Entry(detection_frame, textvariable=self.sensitivity_str, width=5).grid(row=0, column=2)
 
         ttk.Button(parent, text="Run Analysis", command=self.controller.run_analysis, style="Accent.TButton").grid(row=5, column=0, columnspan=3, pady=(15,5), sticky="ew")
 
@@ -295,9 +296,17 @@ class AnalysisView:
         ttk.Label(parent, textvariable=self.edit_end_label_var, width=5).grid(row=1, column=2)
         ttk.Button(parent, text="Apply Changes", command=self.controller.apply_segment_edit).grid(row=2, column=0, columnspan=3, sticky="ew", pady=5)
 
+    ### 変更点: パラメータ取得部分を sensitivity に対応 ###
     def get_ui_parameters(self) -> dict:
         try:
-            params = {"filepath": self.filepath_var.get(), "use_smoothing": self.use_smoothing_var.get(), "smoothing_window": int(self.smoothing_window_var.get()), "gradient_high_factor": self.gradient_high_factor_var.get(), "gradient_low_factor": self.gradient_low_factor_var.get(), "start_filter": int(self.start_filter_var.get()), "filter_step": int(self.filter_step_var.get())}
+            params = {
+                "filepath": self.filepath_var.get(),
+                "use_smoothing": self.use_smoothing_var.get(),
+                "smoothing_window": int(self.smoothing_window_var.get()),
+                "sensitivity": self.sensitivity_var.get(), # sensitivity を取得
+                "start_filter": int(self.start_filter_var.get()),
+                "filter_step": int(self.filter_step_var.get())
+            }
             return params
         except (ValueError, TypeError) as e:
             self.show_error("Invalid Parameter", f"パラメータを確認してください。\n詳細: {e}")
@@ -370,7 +379,7 @@ class AnalysisView:
     def show_info(self, title: str, message: str): messagebox.showinfo(title, message)
 
 # ==============================================================================
-# CONTROLLER: ViewとModelを仲介 (変更なし)
+# CONTROLLER: ViewとModelを仲介
 # ==============================================================================
 class AnalysisController:
     def __init__(self, root: tk.Tk):
@@ -393,7 +402,10 @@ class AnalysisController:
             self.model.filter_params = {'start': params['start_filter'], 'step': params['filter_step']}
             self.model.load_data(params['filepath'])
             self.model.process_data(params['use_smoothing'], params['smoothing_window'])
-            initial_segments, debug_data = self.model.analyze_by_gradient(params['gradient_high_factor'], params['gradient_low_factor'])
+            
+            ### 変更点: sensitivity をモデルに渡す ###
+            initial_segments, debug_data = self.model.analyze_by_gradient(params['sensitivity'])
+            
             if Config.DEBUG_MODE: self._show_debug_plots(debug_data)
             self.model.segments = initial_segments
             self.model.run_cleanup_and_finalize()
@@ -425,7 +437,7 @@ class AnalysisController:
         plt.tight_layout(); plt.show(block=False)
 
     def browse_file(self):
-        path = filedialog.askopenfilename(title="Select a Data File", filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        path = filedialog.askopenfilename(title="Select a Data File", filetypes=[("CSV files", "*.csv"), ("Text files", "*.txt"), ("All files", "*.*")])
         if path: self.view.filepath_var.set(path)
 
     def select_segment(self, seg_id: int):
@@ -453,5 +465,11 @@ class AnalysisController:
 if __name__ == '__main__':
     root = tk.Tk()
     root.geometry("1400x900")
+    # Sun Valley Theme (もしインストールされていれば)
+    try:
+        import sv_ttk
+        sv_ttk.set_theme("dark") # "light" or "dark"
+    except ImportError:
+        pass # なければデフォルトテーマで実行
     app = AnalysisController(root)
     root.mainloop()
