@@ -2,11 +2,11 @@ import numpy as np
 import tkinter as tk
 from tkinter import filedialog
 from tkinter import simpledialog
-from tkinter import messagebox # エラー表示のために追加
+from tkinter import messagebox
 import os
 import pandas as pd
 from tqdm import tqdm
-import math # 円周率(pi)のために追加
+import math
 
 # --- 設定セクション ---
 TARGET_WAVELENGTH = 337
@@ -18,10 +18,9 @@ class AreaInputDialog:
     def __init__(self, parent):
         self.top = tk.Toplevel(parent)
         self.top.title("励起エリア面積の計算")
-        self.top.geometry("350x250") # ウィンドウサイズを少し調整
+        self.top.geometry("350x250")
         self.result_area = None
 
-        # --- ウィジェットの作成 ---
         self.shape_var = tk.StringVar(value="rectangle")
 
         tk.Label(self.top, text="励起形状を選択してください:").grid(row=0, column=0, columnspan=4, sticky="w", padx=10, pady=5)
@@ -127,17 +126,63 @@ def extract_absorbance_from_spectrum(spectrum_file, target_wavelength, skip_head
         print(f"エラー: スペクトルファイル '{spectrum_file}' の処理中にエラー: {e}")
         return None, None, None
 
-def extract_emission_intensity(emission_file, skip_rows):
+def extract_emission_intensity(emission_file, skip_rows, cut_light, ignore_range):
+    """発光強度を抽出する。励起光カットのロジックを追加。"""
     try:
         emission_data = np.loadtxt(emission_file, skiprows=skip_rows)
-        return np.max(emission_data[:, 1])
+        # ファイルが空、または1行しかない場合の対策
+        if emission_data.ndim == 1:
+            emission_data = np.array([emission_data])
+        if emission_data.shape[0] == 0:
+             print(f"警告: '{os.path.basename(emission_file)}' は空または無効なファイルです。")
+             return None
+
+        if not cut_light:
+            # 従来通り、全体の最大値を取得
+            return np.max(emission_data[:, 1])
+        else:
+            # 指定された波長範囲を除外して最大値を取得
+            lower_bound, upper_bound = ignore_range
+            mask = (emission_data[:, 0] < lower_bound) | (emission_data[:, 0] > upper_bound)
+            filtered_data = emission_data[mask]
+
+            if filtered_data.shape[0] == 0:
+                # フィルター後にデータが残らなかった場合
+                print(f"エラー: '{os.path.basename(emission_file)}'では、指定範囲を除外後にデータが残りませんでした。")
+                return None # エラーを示すためにNoneを返す
+            
+            return np.max(filtered_data[:, 1])
+
     except Exception as e:
         print(f"エラー: '{os.path.basename(emission_file)}' の処理中にエラー: {e}")
-        return None
+        return None # その他のエラーでもNoneを返す
 
 def main():
     root = tk.Tk()
     root.withdraw()
+
+    # ---【新規】励起光カットの確認 ---
+    cut_excitation_light = messagebox.askyesno("励起光カットの確認", "特定の波長範囲（励起光など）を無視して発光強度を計算しますか？")
+    
+    ignore_range = None
+    if cut_excitation_light:
+        lower_bound = simpledialog.askfloat("波長範囲の指定", "無視する波長範囲の【下限値】(nm)を入力してください:", parent=root)
+        if lower_bound is None:
+            print("\n処理がキャンセルされました。")
+            return
+            
+        upper_bound = simpledialog.askfloat("波長範囲の指定", "無視する波長範囲の【上限値】(nm)を入力してください:", parent=root)
+        if upper_bound is None:
+            print("\n処理がキャンセルされました。")
+            return
+
+        if lower_bound >= upper_bound:
+            messagebox.showerror("入力エラー", "下限値は上限値より小さい値を入力してください。", parent=root)
+            return
+            
+        ignore_range = (lower_bound, upper_bound)
+        print(f"情報: {lower_bound} nm から {upper_bound} nm の範囲を無視します。")
+    # --- ここまで ---
 
     input_file_path = filedialog.askopenfilename(title="励起強度データファイル(.xlsx)を選択してください", filetypes=[("Excel files", "*.xlsx")])
     if not input_file_path: return
@@ -167,13 +212,23 @@ def main():
             print("\n処理がキャンセルされました。")
             return
         
-        emission_intensity = extract_emission_intensity(emission_file_path, EMISSION_SPECTRUM_SKIP_ROWS)
-        if emission_intensity is None: return
+        # ---【修正】励起光カットのパラメータを渡して関数を呼び出す ---
+        emission_intensity = extract_emission_intensity(
+            emission_file_path, 
+            EMISSION_SPECTRUM_SKIP_ROWS,
+            cut_excitation_light,
+            ignore_range
+        )
+        
+        # ---【新規】エラー処理 ---
+        if emission_intensity is None:
+            messagebox.showerror("処理中断", f"ファイル '{os.path.basename(emission_file_path)}' の処理でエラーが発生しました。\n指定範囲の除外後、有効なデータが存在しないか、ファイルの読み込みに失敗しました。")
+            return
+
         emission_intensities.append(emission_intensity)
 
-    # --- ここで励起エリアサイズを入力 ---
     dialog = AreaInputDialog(root)
-    root.wait_window(dialog.top) # 専用ウィンドウが閉じるまで待機
+    root.wait_window(dialog.top)
 
     if dialog.result_area is not None:
         excitation_area_size = dialog.result_area
