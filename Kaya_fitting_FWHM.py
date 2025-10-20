@@ -24,6 +24,7 @@ class FWHMAnalyzerApp:
         self.df_results = None
         self.spectrum_files_data = []
         self.fwhm_results = {}
+        self.peak_intensity_results = {} 
         self.output_graph_dir = None
         self.graph_frames = {}
 
@@ -35,14 +36,12 @@ class FWHMAnalyzerApp:
         control_frame.pack(fill=tk.X)
 
         # --- Control Widgets ---
-        # Highlight the primary action button
         self.btn_load_excel = ttk.Button(control_frame, text="① Select Excel File", command=self.load_excel_file, style="Accent.TButton")
         self.btn_load_excel.pack(side=tk.LEFT, padx=5)
 
         self.btn_reset = ttk.Button(control_frame, text="Reset", command=self._reset_application)
         self.btn_reset.pack(side=tk.LEFT, padx=5)
 
-        # Highlight the final action button
         self.btn_save = ttk.Button(control_frame, text="③ Save Results", command=self.save_results, state="disabled", style="Accent.TButton")
         self.btn_save.pack(side=tk.RIGHT, padx=5)
 
@@ -84,6 +83,7 @@ class FWHMAnalyzerApp:
             self.df_results = None
             self.spectrum_files_data.clear()
             self.fwhm_results.clear()
+            self.peak_intensity_results.clear() 
             self.output_graph_dir = None
             self.graph_frames.clear()
             self.status_label.config(text="Please start by selecting an Excel file.")
@@ -210,11 +210,10 @@ class FWHMAnalyzerApp:
         button_frame = ttk.Frame(graph_frame)
         button_frame.pack(side=tk.RIGHT, padx=10, anchor='center')
         
-        # Highlight the analysis button
         analyze_button = ttk.Button(button_frame, text="② Start Analysis", command=lambda idx=graph_index: self.start_analysis_for(idx), style="Accent.TButton")
         analyze_button.pack(pady=5)
         
-        status_label = ttk.Label(button_frame, text="Not Processed", foreground="red")
+        status_label = ttk.Label(button_frame, text="Not Processed", foreground="red", justify=tk.LEFT)
         status_label.pack(pady=5)
         self.graph_frames[graph_index] = {'frame': graph_frame, 'status_label': status_label}
 
@@ -225,19 +224,25 @@ class FWHMAnalyzerApp:
         except (StopIteration, KeyError):
             messagebox.showerror("Internal Error", f"Could not find data or graph for index '{graph_index}'.")
             return
+            
         raw_data = spectrum_info['data']
         filter_num = spectrum_info['filter_num']
         graph_save_path = os.path.join(self.output_graph_dir, f"filter_{filter_num}_result.png")
+        
         dialog = AnalysisWindow(self.master, raw_data, f"Detailed Analysis: Filter {filter_num}", graph_save_path)
         self.master.wait_window(dialog.top)
+
         if dialog.fwhm_result is not None and not np.isnan(dialog.fwhm_result):
             self.fwhm_results[graph_index] = dialog.fwhm_result
-            status_text = f"FWHM: {dialog.fwhm_result:.3f}"
+            self.peak_intensity_results[graph_index] = dialog.peak_intensity_result
+            status_text = f"FWHM: {dialog.fwhm_result:.3f}\nIntensity: {dialog.peak_intensity_result:.2f}"
             status_color = "green"
         else:
             self.fwhm_results[graph_index] = np.nan
+            self.peak_intensity_results[graph_index] = np.nan
             status_text = "Skipped"
             status_color = "orange"
+            
         status_label.config(text=status_text, foreground=status_color)
 
     def save_results(self):
@@ -251,13 +256,22 @@ class FWHMAnalyzerApp:
             initialfile=initial_file
         )
         if not output_path: return
-        fwhm_series = pd.Series(self.fwhm_results, name="FWHM (nm)").reindex(self.df_results.index)
-        final_df = self.df_results.join(fwhm_series)
+        
+        final_df = self.df_results.copy()
+        peak_intensity_series = pd.Series(self.peak_intensity_results, name="Peak_emission_intensity").reindex(final_df.index)
+        fwhm_series = pd.Series(self.fwhm_results, name="FWHM (nm)").reindex(final_df.index)
+        
+        insert_loc = len(final_df.columns)
+
+        final_df.insert(loc=insert_loc, column="Peak_emission_intensity", value=peak_intensity_series)
+        final_df.insert(loc=insert_loc + 1, column="FWHM (nm)", value=fwhm_series)
+        
         try:
             final_df.to_excel(output_path, index=False)
             messagebox.showinfo("Success", f"Results saved to '{os.path.basename(output_path)}'.\nGraph images are in the 'FWHM_Analysis_Graphs' folder.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save file: {e}")
+
 
 class AnalysisWindow:
     def __init__(self, parent, data, title, save_path):
@@ -269,6 +283,7 @@ class AnalysisWindow:
         self.data = data
         self.save_path = save_path
         self.fwhm_result = np.nan
+        self.peak_intensity_result = np.nan
         self.fit_range_span = None
 
         self.x, self.y_raw = self.data[:, 0], self.data[:, 1]
@@ -284,7 +299,10 @@ class AnalysisWindow:
             self.line_raw, = self.ax.plot(self.x, self.y_raw, '.', color='skyblue', markersize=3, label="Raw Data")
             self.line_smooth, = self.ax.plot(self.x, self.y_smooth, color='blue', linewidth=1.5, label="Smoothed Data")
             self.line_fit, = self.ax.plot(self.x, self.y_smooth, '--', color='red', linewidth=2, label="Fit (Pseudo-Voigt)")
+            
+            # The invalid 'justify' argument has been removed from the line below
             self.fwhm_text = self.ax.text(0.05, 0.95, '', transform=self.ax.transAxes, fontsize=12, verticalalignment='top', bbox=dict(boxstyle='round,pad=0.5', fc='wheat', alpha=0.7))
+            
             self.ax.legend()
             self.ax.grid(True)
             self.ax.set_xlabel("Wavelength (nm)")
@@ -300,7 +318,6 @@ class AnalysisWindow:
         button_frame = ttk.Frame(self.top, padding=5)
         button_frame.pack()
         
-        # Highlight the approval button
         approve_button = ttk.Button(button_frame, text="Approve this Result", command=self.on_approve, style="Accent.TButton")
         approve_button.pack(side=tk.LEFT, padx=10)
         
@@ -321,19 +338,23 @@ class AnalysisWindow:
             self.fit_range_span.remove()
         self.fit_range_span = self.ax.axvspan(min_val, max_val, color='gray', alpha=0.2, zorder=0)
 
-        idx_range = (self.x >= min_val) & (self.x <= max_val)
-        x_fit, y_fit = self.x[idx_range], self.y_smooth[idx_range]
+        idx_range_smooth = (self.x >= min_val) & (self.x <= max_val)
+        x_fit, y_fit_smooth = self.x[idx_range_smooth], self.y_smooth[idx_range_smooth]
         
-        if len(x_fit) < 5: return
+        y_raw_in_range = self.y_raw[idx_range_smooth]
+        
+        if len(x_fit) < 5: 
+            self.canvas.draw_idle()
+            return
         
         try:
-            peak_idx = np.argmax(y_fit)
-            amplitude0 = y_fit[peak_idx]
+            peak_idx = np.argmax(y_fit_smooth)
+            amplitude0 = y_fit_smooth[peak_idx]
             center0 = x_fit[peak_idx]
             try:
                 half_max = amplitude0 / 2.0
-                left_idx = (np.abs(y_fit[:peak_idx] - half_max)).argmin()
-                right_idx = (np.abs(y_fit[peak_idx:] - half_max)).argmin() + peak_idx
+                left_idx = (np.abs(y_fit_smooth[:peak_idx] - half_max)).argmin()
+                right_idx = (np.abs(y_fit_smooth[peak_idx:] - half_max)).argmin() + peak_idx
                 fwhm0 = x_fit[right_idx] - x_fit[left_idx]
             except (ValueError, IndexError):
                 fwhm0 = (x_fit[-1] - x_fit[0]) / 2.0
@@ -341,17 +362,26 @@ class AnalysisWindow:
             eta0 = 0.5
             p0 = [amplitude0, center0, fwhm0, eta0]
             bounds = ([0, x_fit.min(), 0, 0], [np.inf, x_fit.max(), np.inf, 1])
-            popt, _ = curve_fit(self.pseudo_voigt, x_fit, y_fit, p0=p0, bounds=bounds, maxfev=5000)
+            popt, _ = curve_fit(self.pseudo_voigt, x_fit, y_fit_smooth, p0=p0, bounds=bounds, maxfev=5000)
             
             self.fwhm_result = popt[2]
             y_fitted_full = self.pseudo_voigt(self.x, *popt)
             self.line_fit.set_ydata(y_fitted_full)
-            self.fwhm_text.set_text(f'FWHM: {self.fwhm_result:.3f} nm')
-        
+            
+            if y_raw_in_range.size > 0:
+                self.peak_intensity_result = np.max(y_raw_in_range)
+            else:
+                self.peak_intensity_result = np.nan
+
+            fwhm_text = f'FWHM: {self.fwhm_result:.3f} nm'
+            intensity_text = f'Peak Intensity: {self.peak_intensity_result:.2f}'
+            self.fwhm_text.set_text(f'{fwhm_text}\n{intensity_text}')
+
         except (RuntimeError, ValueError):
             self.line_fit.set_ydata(np.full_like(self.x, np.nan))
-            self.fwhm_text.set_text('FWHM: Fit Failed')
+            self.fwhm_text.set_text('FWHM: Fit Failed\nPeak Intensity: N/A')
             self.fwhm_result = np.nan
+            self.peak_intensity_result = np.nan
 
         self.canvas.draw_idle()
 
@@ -364,6 +394,7 @@ class AnalysisWindow:
 
     def on_skip(self):
         self.fwhm_result = np.nan
+        self.peak_intensity_result = np.nan
         self.save_figure()
         self.top.destroy()
         
